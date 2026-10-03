@@ -138,7 +138,8 @@ def _is_executable(p: Path) -> bool:
         if not p.is_file():
             return False
         if os.name == "nt":
-            return True  # Windows has no exec bit; extension is enough
+            # Windows has no exec bit; require an executable extension
+            return p.suffix.lower() in (".exe", ".bat", ".cmd", ".com")
         return os.access(str(p), os.X_OK)
     except OSError:
         return False

@@ -163,10 +163,10 @@ class TestFFmpegLocator(unittest.TestCase):
         self.assertIn("project", [c[0] for c in cands])
 
     def test_meipass_candidates_present_when_frozen(self) -> None:
-       with mock.patch.object(sys, "_MEIPASS", "/frozen", create=True):
-           paths = [p.as_posix() for src, p in loc.candidate_paths() if src == "bundled"]
-      self.assertTrue(any(p.startswith("/frozen") for p in paths))
-      self.assertTrue(any(p.endswith(f"bin/{loc.FFMPEG_EXE_NAME}") for p in paths))
+        with mock.patch.object(sys, "_MEIPASS", "/frozen", create=True):
+            paths = [p.as_posix() for src, p in loc.candidate_paths() if src == "bundled"]
+        self.assertTrue(any(p.startswith("/frozen") for p in paths))
+        self.assertTrue(any(p.endswith(f"bin/{loc.FFMPEG_EXE_NAME}") for p in paths))
 
     def test_not_found_returns_none(self) -> None:
         empty = self.dir / "empty"

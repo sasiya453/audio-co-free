@@ -6,7 +6,9 @@ sure the repository root is importable when frozen, and launches the UI.
 
 Usage
 -----
-    python main.py
+    python main.py                 # launch the GUI
+    python main.py --selftest      # headless DSP round-trip (exit 0 = OK)
+    AudioMaskPro.exe --selftest    # same, from the frozen bundle
 """
 from __future__ import annotations
 
@@ -59,11 +61,59 @@ def _install_thread_excepthook(log: logging.Logger) -> None:
         pass
 
 
+def _selftest(log: logging.Logger) -> int:
+    """Headless engine smoke test used to validate frozen builds.
+
+    Synthesises a 2 s tone, runs the complete DSP pipeline (time-stretch,
+    pitch-shift, bandpass, micro-reverb, normalisation) and writes a WAV
+    into a temporary directory. Exercises numba JIT, soxr, libsndfile and
+    scipy inside the bundle. Returns 0 on success, 3 on failure.
+    """
+    import shutil
+    import tempfile
+
+    try:
+        import numpy as np
+        import soundfile as sf
+        from core.audio_engine import AudioMasker, MaskSettings
+
+        sr = 22050
+        t = np.arange(2 * sr, dtype=np.float32) / sr
+        tone = (0.3 * np.sin(2 * np.pi * 440.0 * t)).astype(np.float32)
+        tmp = Path(tempfile.mkdtemp(prefix="audiomask_selftest_"))
+        try:
+            src = tmp / "tone.wav"
+            sf.write(str(src), tone, sr)
+            settings = MaskSettings(pitch_semitones=1.5, speed_factor=1.05,
+                                    bandpass_enabled=True, bandpass_intensity=0.6,
+                                    reverb_enabled=True, reverb_mix=0.18,
+                                    output_format="wav").validate()
+            out = AudioMasker().process_file(str(src), str(tmp / "out"), settings)
+            data, out_sr = sf.read(str(out), dtype="float32")
+            if data.size == 0 or not np.isfinite(data).all():
+                raise RuntimeError("output is empty or contains NaN/Inf")
+            if float(np.abs(data).max()) > 1.0:
+                raise RuntimeError("output exceeds 0 dBFS - normalisation failed")
+            msg = (f"SELFTEST OK: {out} ({len(data) / out_sr:.2f}s @ {out_sr} Hz, "
+                   f"peak {float(np.abs(data).max()):.3f})")
+            log.info(msg)
+            print(msg)
+            return 0
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+    except Exception as exc:  # noqa: BLE001 - report everything
+        log.exception("SELFTEST FAILED")
+        print(f"SELFTEST FAILED: {exc!r}", file=sys.stderr or sys.stdout)
+        return 3
+
+
 def main() -> int:
     _ensure_import_path()
     _setup_logging()
     log = logging.getLogger("audiomask.main")
     _install_thread_excepthook(log)
+    if "--selftest" in sys.argv[1:]:
+        return _selftest(log)
     try:
         import customtkinter as ctk  # noqa: F401 - verify GUI deps early
         from ui.app_ui import AudioMaskApp

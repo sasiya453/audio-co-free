@@ -55,7 +55,11 @@ try:
     import librosa
     import librosa.effects
 except ImportError as exc:  # pragma: no cover - import guard
-    raise ImportError("librosa is required: pip install librosa") from exc
+    # Surface the *root* failure (e.g. a missing transitive module inside a
+    # frozen bundle) instead of hiding it behind the generic install hint.
+    raise ImportError(
+        f"librosa is required: pip install librosa (root cause: {exc!r})"
+    ) from exc
 
 try:
     from scipy import signal as sps

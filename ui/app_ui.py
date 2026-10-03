@@ -51,7 +51,7 @@ except Exception:  # noqa: BLE001
 logger = logging.getLogger("audiomask.ui")
 
 APP_TITLE = "AudioMask Pro"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 WINDOW_SIZE = (880, 800)
 MIN_SIZE = (800, 720)
 POLL_MS = 100

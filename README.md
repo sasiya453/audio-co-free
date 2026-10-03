@@ -24,8 +24,24 @@ Every input file runs through the same deterministic pipeline
 | 4 | Micro-reverb | 30 ms delay-line feedback loop (numpy) | Subtle room character / fingerprint smearing |
 | 5 | Peak normalise | Scale to −1 dBFS | Guarantees zero digital clipping |
 
-Input: WAV, FLAC, OGG/Opus, AIFF natively; MP3, M4A/AAC, WMA, MP4 via FFmpeg
-(auto-detected on `PATH`, optional).
+### Supported input — universal format support (v1.1)
+
+AudioMask Pro ships with a **bundled static FFmpeg** (`bin\ffmpeg.exe`, placed
+in `_internal\bin\` of the packaged app). End users do **not** need to install
+FFmpeg; the engine finds the bundled copy automatically and falls back to a
+system-wide FFmpeg on `PATH` only if the bundled one is missing.
+
+| Category | Extensions | Decoder |
+|---|---|---|
+| Uncompressed / lossless | `.wav .flac .aiff .aif .w64 .caf .au` … | libsndfile (soundfile) |
+| Lossy audio | `.mp3 .ogg .oga .opus` | libsndfile, FFmpeg fallback |
+| Compressed audio (needs FFmpeg) | `.m4a .m4b .aac .wma .ac3 .amr .mka .mp2 .ape .tta` … | **bundled FFmpeg** → temp WAV |
+| Video containers (audio track extracted) | `.mp4 .mkv .mov .webm .avi .ts .m4v .3gp .flv .wmv` … | **bundled FFmpeg** → temp WAV |
+
+Files with unknown extensions are not rejected — FFmpeg sniffs the container.
+The start-up console shows which backend is active, e.g.
+`[INFO] FFmpeg backend: Bundled (7.1) -> …\_internal\bin\ffmpeg.exe`.
+
 Output: WAV (16-bit), FLAC, OGG Vorbis, MP3 (when the bundled libsndfile ≥ 1.1 supports it).
 
 ![screenshot placeholder](docs/screenshot.png)
@@ -38,10 +54,11 @@ Output: WAV (16-bit), FLAC, OGG Vorbis, MP3 (when the bundled libsndfile ≥ 1.1
 | Running the `.exe` | Running / building from source |
 |---|---|
 | Windows 10 x64 (or 11) | Python 3.10+ **64-bit** |
-| ~500 MB disk space for the bundle | `pip install -r requirements.txt` |
-| *Optional:* [FFmpeg](https://ffmpeg.org/download.html) on `PATH` for MP3/M4A/WMA **input** | Same FFmpeg note applies |
+| ~650 MB disk space for the bundle (incl. ~150 MB FFmpeg) | `pip install -r requirements.txt` |
+| **Nothing else** — FFmpeg is bundled | `python tools/fetch_ffmpeg.py` (downloads `bin/ffmpeg(.exe)`), or FFmpeg on `PATH` |
 
-No Python installation is required on the machine that runs the packaged build.
+No Python installation and **no FFmpeg installation** are required on the
+machine that runs the packaged build.
 
 ---
 
@@ -58,6 +75,17 @@ Verify the installation headlessly (writes nothing permanent, exit code 0 = OK):
 AudioMaskPro.exe --selftest
 ```
 
+The self-test prints the active FFmpeg backend, runs the full DSP pipeline on a
+synthesised tone and — when FFmpeg is available — encodes that tone to `.m4a`
+and decodes it back, proving that compressed-format support works on this PC:
+
+```
+SELFTEST FFmpeg backend: Bundled (N-1270xx) -> C:\...\AudioMaskPro\_internal\bin\ffmpeg.exe
+SELFTEST DSP pipeline OK (1.90s @ 22050 Hz, peak 0.891)
+SELFTEST M4A round-trip OK (21.9 kB, 2.00s @ 22050 Hz, peak 0.302)
+SELFTEST OK: ...\tone_masked.wav [ffmpeg: Bundled (N-1270xx)]
+```
+
 ---
 
 ## Run from source
@@ -68,11 +96,13 @@ cd audio-co-free
 python -m venv .venv
 .venv\Scripts\activate          # Windows   (source .venv/bin/activate on POSIX)
 pip install -r requirements.txt
+python tools/fetch_ffmpeg.py    # optional: bundled FFmpeg into bin/ (else system PATH is used)
 python main.py                  # GUI
-python main.py --selftest       # headless pipeline check
+python main.py --selftest       # headless pipeline + FFmpeg M4A round-trip check
 ```
 
-Set `AUDIOMASK_DEBUG=1` to enable DEBUG-level logging.
+Set `AUDIOMASK_DEBUG=1` to enable DEBUG-level logging. Set `AUDIOMASK_FFMPEG`
+to the full path of an `ffmpeg` executable to override auto-detection.
 
 Headless CLI (no GUI) is also available:
 
@@ -91,13 +121,22 @@ build.bat console    :: one-folder bundle that keeps a console window (debugging
 build.bat clean      :: remove build\, dist\, .venv
 ```
 
-`build.bat` creates `.venv`, installs `requirements.txt`, runs the unit tests,
-then invokes `pyinstaller --noconfirm --clean build.spec`.
-After building, run `dist\AudioMaskPro\AudioMaskPro.exe --selftest` to confirm
-that numba, soxr, libsndfile and scipy all work inside the bundle.
+`build.bat` pipeline:
+
+1. creates `.venv` and installs `requirements.txt`;
+2. **fetches the static FFmpeg** (`python tools\fetch_ffmpeg.py --platform win64`
+   → `bin\ffmpeg.exe`, skipped when already present) and checks it runs;
+3. runs the unit tests;
+4. invokes `pyinstaller --noconfirm --clean build.spec`;
+5. verifies `dist\AudioMaskPro\_internal\bin\ffmpeg.exe` exists;
+6. runs `dist\AudioMaskPro\AudioMaskPro.exe --selftest` **with the system `PATH`
+   stripped**, so the build only passes if the *bundled* FFmpeg decodes M4A.
 
 Build details (`build.spec`):
 
+* Bundles `bin/ffmpeg.exe` (+ `bin/FFMPEG_LICENSE.txt`) into `bin/` inside the
+  bundle (`_internal\bin\` one-folder, `%TEMP%\_MEIxxxx\bin\` one-file). If the
+  binary is missing the spec prints a loud warning but still builds.
 * `collect_all` for `customtkinter`, `librosa`, `soundfile`, `soxr`, `lazy_loader`
   (theme JSON files, `libsndfile_x64.dll`, librosa data files).
 * Hidden imports for dynamically loaded `scipy.signal/special/fft`, `numba`,
@@ -108,7 +147,17 @@ Build details (`build.spec`):
 * Switches: `ONEFILE=1`, `CONSOLE=1` (environment variables read by the spec).
 * Optional icon: place `assets/icon.ico` (Windows) / `assets/icon.png` (POSIX) and rebuild.
 
-Linux/macOS/WSL: `./build.sh [folder|onefile|smoke]` validates the same spec.
+Linux/macOS/WSL: `./build.sh [folder|onefile|smoke]` validates the same spec
+(fetches the `linux64` FFmpeg build, runs the PATH-stripped frozen self-test).
+
+### Bundled FFmpeg licence note
+
+`tools/fetch_ffmpeg.py` downloads the static builds published by
+[BtbN/FFmpeg-Builds](https://github.com/BtbN/FFmpeg-Builds). The default is the
+**GPL** variant (most codecs). If you redistribute AudioMask Pro binaries and
+prefer LGPL terms, fetch with `python tools/fetch_ffmpeg.py --lgpl`. The
+licence text from the archive is shipped as `_internal\bin\FFMPEG_LICENSE.txt`.
+The binary itself (~150 MB) is git-ignored; only `bin/README.md` is committed.
 
 ---
 
@@ -153,7 +202,9 @@ librosa, soundfile, libsndfile, FFmpeg) — attach it to bug reports.
 
 | Symptom | Fix |
 |---|---|
-| *"FFmpeg not found"* when opening MP3/M4A/WMA | Install FFmpeg and add it to `PATH` (`winget install Gyan.FFmpeg`), or convert to WAV/FLAC first. |
+| Console shows `[WARN] FFmpeg backend: not found` | The bundled `_internal\bin\ffmpeg.exe` is missing (incomplete copy / antivirus quarantine). Reinstall the whole `AudioMaskPro` folder, or install FFmpeg and add it to `PATH` (`winget install Gyan.FFmpeg`), or set `AUDIOMASK_FFMPEG=C:\path\to\ffmpeg.exe`. |
+| `--selftest` fails at *M4A round-trip* | Antivirus blocked `ffmpeg.exe` from executing, or the file is corrupt. Whitelist the folder; rebuild after `del bin\ffmpeg.exe` to re-download. |
+| *"Format not recognised"* on `.m4a/.aac/.wma/.mp4` | Only happens when no FFmpeg backend is available — see the two rows above. |
 | Antivirus flags `AudioMaskPro.exe` | PyInstaller bundles are a common false positive. Build from source yourself with `build.bat`, or whitelist the folder. The build never uses UPX to reduce this risk. |
 | *"The output file is locked"* / `PermissionError` | Close the file in your media player / DAW, or pick another output folder. |
 | *"Disk full"* | Free space on the output drive; WAV output is ~10 MB per minute of stereo audio. |
@@ -167,24 +218,29 @@ librosa, soundfile, libsndfile, FFmpeg) — attach it to bug reports.
 ## Tests
 
 ```bash
-python -m unittest discover -s tests      # 59 tests, no display required
+python -m unittest discover -s tests      # 102 tests, no display required
 ```
 
 * `tests/test_engine.py` — DSP stages on synthetic signals, settings validation, I/O error paths.
-* `tests/test_ui_logic.py` — logging bootstrap, hardening paths, pure UI helpers (no Tk).
+* `tests/test_ui_logic.py` — logging bootstrap, hardening paths, pure UI helpers incl. the FFmpeg banner (no Tk).
+* `tests/test_formats.py` — M4A/AAC/OGG/Opus/FLAC/WMA/MP3/MP4/MKV/MOV/WebM decoding through a
+  *bundled-only* FFmpeg (system `PATH` stripped). Skipped when no FFmpeg is available to build fixtures.
 
 ---
 
 ## Project layout
 
 ```
-main.py                 entry point (logging, crash guard, --selftest, launches UI)
-core/audio_engine.py    AudioMasker, MaskSettings, probe(), CLI
+main.py                 entry point (logging, crash guard, --selftest incl. FFmpeg M4A round-trip, launches UI)
+core/audio_engine.py    AudioMasker, MaskSettings, probe(), CLI (FFmpeg-first decode for compressed/video)
+core/ffmpeg_locator.py  find_ffmpeg(): env -> bundled (_MEIPASS/bin, exe dir) -> repo bin/ -> PATH
 core/logging_setup.py   rotating file logging + environment dump
-ui/app_ui.py            CustomTkinter application (threaded batch processing)
+ui/app_ui.py            CustomTkinter application (threaded batch processing, FFmpeg status banner)
+bin/                    bundled FFmpeg (git-ignored binary, fetched by tools/fetch_ffmpeg.py)
+tools/fetch_ffmpeg.py   downloads a static FFmpeg build (win64 / linux64, --lgpl, --check)
 hooks/rthook_numba.py   PyInstaller runtime hook (numba cache redirection)
-build.spec              PyInstaller specification (one-folder / one-file)
-build.bat / build.sh    build scripts (Windows / POSIX)
+build.spec              PyInstaller specification (one-folder / one-file, bundles bin/ffmpeg)
+build.bat / build.sh    build scripts (Windows / POSIX): deps -> FFmpeg -> tests -> build -> selftest
 tests/                  unit tests
 handoff.md              session-to-session state for AI agents
 ```

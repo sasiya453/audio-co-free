@@ -417,5 +417,81 @@ class UiHelperTests(unittest.TestCase):
         self.assertEqual(app.add_files([sub]), 0)
 
 
+# --------------------------------------------------------------------------- #
+# main.py --selftest (packaging gate, Task F3)
+# --------------------------------------------------------------------------- #
+class SelftestTests(unittest.TestCase):
+    """``main._selftest`` is the gate run by build.bat / build.sh on the frozen
+    exe. It must report the FFmpeg backend, pass without FFmpeg (warning only)
+    and, when FFmpeg is available, prove the M4A round-trip."""
+
+    @classmethod
+    def setUpClass(cls):
+        import importlib
+        cls.main = importlib.import_module("main")
+        cls.ffmpeg = AudioMasker().ffmpeg_path
+
+    def _run(self):
+        import io
+        from contextlib import redirect_stdout
+        buf = io.StringIO()
+        log = logging.getLogger("audiomask.test.selftest")
+        with redirect_stdout(buf):
+            rc = self.main._selftest(log)
+        return rc, buf.getvalue()
+
+    def test_selftest_passes_and_reports_backend(self):
+        rc, out = self._run()
+        self.assertEqual(rc, 0, out)
+        self.assertIn("SELFTEST FFmpeg backend:", out)
+        self.assertIn("SELFTEST DSP pipeline OK", out)
+        self.assertIn("SELFTEST OK:", out)
+        if self.ffmpeg:
+            self.assertIn("M4A round-trip OK", out)
+            self.assertNotIn("[ffmpeg: none]", out)
+        else:
+            self.assertIn("no FFmpeg backend", out)
+            self.assertIn("[ffmpeg: none]", out)
+
+    def test_selftest_without_ffmpeg_is_warning_not_failure(self):
+        from core import ffmpeg_locator
+        with mock.patch.object(ffmpeg_locator, "find_ffmpeg", return_value=None), \
+                mock.patch.object(ffmpeg_locator, "describe",
+                                  return_value="FFmpeg backend: NOT FOUND (test)"), \
+                mock.patch("shutil.which", return_value=None):
+            rc, out = self._run()
+        self.assertEqual(rc, 0, out)
+        self.assertIn("NOT FOUND (test)", out)
+        self.assertIn("no FFmpeg backend", out)
+        self.assertIn("[ffmpeg: none]", out)
+        self.assertNotIn("M4A round-trip", out)
+
+    def test_selftest_roundtrip_failure_is_exit_3(self):
+        if not self.ffmpeg:
+            self.skipTest("FFmpeg not available")
+        with mock.patch.object(self.main, "_selftest_ffmpeg_roundtrip",
+                               side_effect=RuntimeError("boom m4a")):
+            rc, out = self._run()
+        self.assertEqual(rc, 3)
+        self.assertIn("SELFTEST DSP pipeline OK", out)
+        self.assertNotIn("SELFTEST OK:", out)
+
+    def test_roundtrip_helper_decodes_m4a(self):
+        if not self.ffmpeg:
+            self.skipTest("FFmpeg not available")
+        import shutil
+        masker = AudioMasker()
+        n = int(1.0 * SR)
+        tone = (0.3 * np.sin(2 * np.pi * 440 * np.arange(n) / SR)).astype(np.float32)
+        tmp = Path(tempfile.mkdtemp(prefix="am_rt_"))
+        try:
+            msg = self.main._selftest_ffmpeg_roundtrip(
+                logging.getLogger("audiomask.test"), masker, tone, SR, tmp)
+            self.assertIn("M4A round-trip OK", msg)
+            self.assertTrue((tmp / "ffmpeg_roundtrip.m4a").is_file())
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main(verbosity=2)

@@ -61,13 +61,77 @@ def _install_thread_excepthook(log: logging.Logger) -> None:
         pass
 
 
+def _emit(log: logging.Logger, msg: str, level: int = logging.INFO) -> None:
+    """Log *and* print (stdout may be ``None`` under ``--noconsole``)."""
+    log.log(level, msg)
+    stream = sys.stdout or sys.stderr
+    if stream is not None:
+        try:
+            print(msg, file=stream, flush=True)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _selftest_ffmpeg_roundtrip(log: logging.Logger, masker, tone, sr: int,
+                               tmp: Path) -> str:
+    """Encode the synthesised tone to ``.m4a`` with the located FFmpeg and
+    decode it back through :meth:`AudioMasker.load_audio`.
+
+    Proves that the *bundled* FFmpeg binary is executable inside the frozen
+    bundle and that the FFmpeg-first decode path for compressed containers
+    works end-to-end. Raises ``RuntimeError`` on any failure.
+    """
+    import subprocess
+
+    import numpy as np
+    import soundfile as sf
+
+    src_wav = tmp / "ffmpeg_src.wav"
+    m4a = tmp / "ffmpeg_roundtrip.m4a"
+    sf.write(str(src_wav), tone, sr)
+    cmd = [masker.ffmpeg_path, "-hide_banner", "-nostdin", "-loglevel", "error",
+           "-y", "-i", str(src_wav), "-vn", "-c:a", "aac", "-b:a", "96k", str(m4a)]
+    try:
+        proc = subprocess.run(  # noqa: S603
+            cmd, capture_output=True, text=True, errors="replace", timeout=120,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise RuntimeError(f"could not run bundled FFmpeg encoder: {exc!r}") from exc
+    if proc.returncode != 0 or not m4a.is_file() or m4a.stat().st_size == 0:
+        raise RuntimeError("FFmpeg failed to encode the test M4A: "
+                           f"rc={proc.returncode} {(proc.stderr or '').strip()[-300:]}")
+
+    audio, got_sr = masker.load_audio(str(m4a))
+    audio = np.asarray(audio, dtype=np.float32)
+    if audio.ndim > 1:
+        audio = audio.mean(axis=0)
+    if audio.size == 0 or not np.isfinite(audio).all():
+        raise RuntimeError("decoded M4A is empty or contains NaN/Inf")
+    dur = audio.size / float(got_sr)
+    expected = tone.size / float(sr)
+    if abs(dur - expected) > 0.25:
+        raise RuntimeError(f"decoded M4A duration {dur:.2f}s != expected {expected:.2f}s")
+    peak = float(np.abs(audio).max())
+    if peak < 0.05:
+        raise RuntimeError(f"decoded M4A is (near) silent, peak={peak:.4f}")
+    return (f"M4A round-trip OK ({m4a.stat().st_size / 1e3:.1f} kB, "
+            f"{dur:.2f}s @ {got_sr} Hz, peak {peak:.3f})")
+
+
 def _selftest(log: logging.Logger) -> int:
     """Headless engine smoke test used to validate frozen builds.
 
-    Synthesises a 2 s tone, runs the complete DSP pipeline (time-stretch,
-    pitch-shift, bandpass, micro-reverb, normalisation) and writes a WAV
-    into a temporary directory. Exercises numba JIT, soxr, libsndfile and
-    scipy inside the bundle. Returns 0 on success, 3 on failure.
+    1. Reports which FFmpeg backend is active (bundled / system / none).
+    2. Synthesises a 2 s tone, runs the complete DSP pipeline (time-stretch,
+       pitch-shift, bandpass, micro-reverb, normalisation) and writes a WAV
+       into a temporary directory. Exercises numba JIT, soxr, libsndfile and
+       scipy inside the bundle.
+    3. If FFmpeg is available: encodes the tone to ``.m4a`` with that binary
+       and decodes it back via :meth:`AudioMasker.load_audio` (universal
+       format path). A failure here is a hard error (exit 3) because the
+       packaged app promises M4A/AAC/MP4 support out of the box.
+
+    Returns 0 on success, 3 on failure.
     """
     import shutil
     import tempfile
@@ -75,7 +139,9 @@ def _selftest(log: logging.Logger) -> int:
     try:
         import numpy as np
         import soundfile as sf
-        from core.audio_engine import AudioMasker, MaskSettings
+        from core.audio_engine import AudioMasker, MaskSettings, ffmpeg_status
+
+        _emit(log, f"SELFTEST {ffmpeg_status()}")
 
         sr = 22050
         t = np.arange(2 * sr, dtype=np.float32) / sr
@@ -88,16 +154,27 @@ def _selftest(log: logging.Logger) -> int:
                                     bandpass_enabled=True, bandpass_intensity=0.6,
                                     reverb_enabled=True, reverb_mix=0.18,
                                     output_format="wav").validate()
-            out = AudioMasker().process_file(str(src), str(tmp / "out"), settings)
+            masker = AudioMasker()
+            out = masker.process_file(str(src), str(tmp / "out"), settings)
             data, out_sr = sf.read(str(out), dtype="float32")
             if data.size == 0 or not np.isfinite(data).all():
                 raise RuntimeError("output is empty or contains NaN/Inf")
             if float(np.abs(data).max()) > 1.0:
                 raise RuntimeError("output exceeds 0 dBFS - normalisation failed")
-            msg = (f"SELFTEST OK: {out} ({len(data) / out_sr:.2f}s @ {out_sr} Hz, "
-                   f"peak {float(np.abs(data).max()):.3f})")
-            log.info(msg)
-            print(msg)
+            _emit(log, f"SELFTEST DSP pipeline OK ({len(data) / out_sr:.2f}s @ "
+                       f"{out_sr} Hz, peak {float(np.abs(data).max()):.3f})")
+
+            if masker.ffmpeg_available:
+                _emit(log, "SELFTEST " + _selftest_ffmpeg_roundtrip(
+                    log, masker, tone, sr, tmp))
+                backend = masker.ffmpeg_info.label if masker.ffmpeg_info else "explicit"
+            else:
+                _emit(log, "SELFTEST WARNING: no FFmpeg backend - M4A/AAC/WMA/MP4 "
+                           "decoding will NOT work in this build (bin/ffmpeg missing?)",
+                      logging.WARNING)
+                backend = "none"
+
+            _emit(log, f"SELFTEST OK: {out} [ffmpeg: {backend}]")
             return 0
         finally:
             shutil.rmtree(tmp, ignore_errors=True)

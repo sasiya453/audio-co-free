@@ -3,8 +3,18 @@ AudioMask Pro - Core DSP Engine
 ================================
 
 Headless audio-processing engine. Loads an audio file (MP3 / WAV / FLAC / OGG
-and anything else libsndfile or FFmpeg can decode), runs the full masking DSP
+/ M4A / AAC / WMA, plus the audio track of MP4 / MKV / MOV / WebM video and
+anything else libsndfile or FFmpeg can decode), runs the full masking DSP
 chain and writes the result to disk.
+
+Decoding strategy ("universal format support"):
+    * libsndfile (``soundfile``) for WAV/FLAC/OGG/AIFF and MP3 on new builds.
+    * A **bundled** FFmpeg binary (``bin/ffmpeg(.exe)``, or next to the
+      frozen executable) is located via :mod:`core.ffmpeg_locator` and used
+      to transcode everything else to a temporary float32 WAV. No system-wide
+      FFmpeg installation is required.
+    * ``librosa``/``audioread`` as a last resort (also benefits from the
+      bundled binary because the locator prepends its folder to ``PATH``).
 
 Pipeline (in order):
     1. Time stretch        (librosa.effects.time_stretch)
@@ -66,6 +76,8 @@ try:
 except ImportError as exc:  # pragma: no cover - import guard
     raise ImportError("scipy is required: pip install scipy") from exc
 
+from core import ffmpeg_locator
+
 
 __all__ = [
     "AudioMasker",
@@ -74,19 +86,48 @@ __all__ = [
     "AudioLoadError",
     "AudioWriteError",
     "SUPPORTED_INPUT_EXTENSIONS",
+    "NATIVE_INPUT_EXTENSIONS",
+    "FFMPEG_PREFERRED_EXTENSIONS",
+    "VIDEO_CONTAINER_EXTENSIONS",
     "SUPPORTED_OUTPUT_FORMATS",
     "DEFAULT_MAX_DURATION_S",
     "FFMPEG_HINT",
+    "ffmpeg_status",
 ]
 
 logger = logging.getLogger("audiomask.engine")
 
-# File types we will attempt to open. soundfile covers most; MP3 falls back to
-# librosa/audioread or FFmpeg depending on the platform build.
-SUPPORTED_INPUT_EXTENSIONS: Tuple[str, ...] = (
-    ".wav", ".flac", ".mp3", ".ogg", ".oga", ".opus", ".aiff", ".aif",
-    ".m4a", ".aac", ".wma", ".mp4",
+# Formats libsndfile opens natively (fast path, no external process).
+NATIVE_INPUT_EXTENSIONS: Tuple[str, ...] = (
+    ".wav", ".wave", ".flac", ".ogg", ".oga", ".opus", ".aiff", ".aif",
+    ".aifc", ".au", ".snd", ".caf", ".w64", ".rf64", ".voc", ".sd2",
+    ".mp3",  # libsndfile >= 1.1 decodes MPEG; older builds fall through
 )
+
+# Compressed audio that libsndfile can NOT read -> go straight to FFmpeg.
+COMPRESSED_INPUT_EXTENSIONS: Tuple[str, ...] = (
+    ".m4a", ".m4b", ".m4r", ".aac", ".adts", ".wma", ".ac3", ".eac3",
+    ".dts", ".mp2", ".mpa", ".amr", ".awb", ".ape", ".wv", ".tta",
+    ".mka", ".weba", ".ra", ".rm", ".spx", ".alac", ".mid",
+)
+
+# Video containers - FFmpeg extracts the first audio track.
+VIDEO_CONTAINER_EXTENSIONS: Tuple[str, ...] = (
+    ".mp4", ".m4v", ".mkv", ".mov", ".webm", ".avi", ".wmv", ".flv",
+    ".3gp", ".3g2", ".mpg", ".mpeg", ".ts", ".mts", ".m2ts", ".vob",
+    ".ogv", ".asf", ".f4v",
+)
+
+#: Extensions for which FFmpeg is tried *first* (libsndfile would only emit a
+#: noisy "Format not recognised" error).
+FFMPEG_PREFERRED_EXTENSIONS: Tuple[str, ...] = (
+    COMPRESSED_INPUT_EXTENSIONS + VIDEO_CONTAINER_EXTENSIONS
+)
+
+# Everything we advertise in file dialogs. Unknown extensions are still
+# attempted (FFmpeg sniffs the container), they just log a warning.
+SUPPORTED_INPUT_EXTENSIONS: Tuple[str, ...] = tuple(dict.fromkeys(
+    NATIVE_INPUT_EXTENSIONS + FFMPEG_PREFERRED_EXTENSIONS))
 
 # Output container -> soundfile subtype. MP3 is only available if the bundled
 # libsndfile is >= 1.1.0 (soundfile >= 0.12); we verify at runtime.
@@ -104,8 +145,14 @@ DEFAULT_MAX_DURATION_S: float = 20 * 60.0
 #: Wall-clock limit for an external FFmpeg transcode.
 FFMPEG_TIMEOUT_S: int = 300
 #: Hint appended to decode failures for MP3/M4A style containers.
-FFMPEG_HINT = ("Install FFmpeg and add it to PATH to decode MP3/M4A/AAC "
-               "(https://ffmpeg.org/download.html).")
+FFMPEG_HINT = ("AudioMask Pro ships with a bundled FFmpeg (bin/ffmpeg.exe); "
+               "if it is missing, reinstall the app or install FFmpeg and add "
+               "it to PATH (https://ffmpeg.org/download.html).")
+
+
+def ffmpeg_status() -> str:
+    """Human readable one-liner describing which FFmpeg backend is active."""
+    return ffmpeg_locator.describe()
 
 
 # --------------------------------------------------------------------------- #
@@ -121,6 +168,14 @@ class AudioLoadError(AudioEngineError):
 
 class AudioWriteError(AudioEngineError):
     """Raised when the processed audio cannot be written."""
+
+
+def _decoder_error(msg: str) -> AudioLoadError:
+    """An :class:`AudioLoadError` tagged as *recoverable* - ``load_audio``
+    records it and tries the next decoder backend instead of aborting."""
+    exc = AudioLoadError(msg)
+    exc._decoder_failure = True  # type: ignore[attr-defined]
+    return exc
 
 
 # --------------------------------------------------------------------------- #
@@ -233,9 +288,10 @@ class AudioMasker:
         If given, audio is resampled to this rate on load. ``None`` keeps the
         native sample rate of the source file.
     ffmpeg_path : str | None
-        Explicit path to an FFmpeg binary used as a decoding fallback for
-        formats libsndfile cannot open (notably MP3 on older builds). If
-        ``None`` the engine searches ``PATH``.
+        Explicit path to an FFmpeg binary used to decode formats libsndfile
+        cannot open (M4A/AAC/WMA, video containers, MP3 on older builds).
+        If ``None`` the engine uses :func:`core.ffmpeg_locator.find_ffmpeg`
+        which prefers the **bundled** binary over anything on ``PATH``.
     max_duration_s : float | None
         Reject inputs longer than this many seconds with
         :class:`AudioLoadError` (memory guard). ``None`` disables the check.
@@ -257,11 +313,30 @@ class AudioMasker:
                  max_duration_s: Optional[float] = DEFAULT_MAX_DURATION_S
                  ) -> None:
         self.target_sr = target_sr
-        self.ffmpeg_path = ffmpeg_path or shutil.which("ffmpeg")
+        self.ffmpeg_info: Optional[ffmpeg_locator.FFmpegInfo] = None
+        if ffmpeg_path:
+            self.ffmpeg_path: Optional[str] = str(ffmpeg_path)
+            ffmpeg_locator.register_ffmpeg(self.ffmpeg_path)
+        else:
+            self.ffmpeg_info = ffmpeg_locator.find_ffmpeg()
+            self.ffmpeg_path = (self.ffmpeg_info.path if self.ffmpeg_info
+                                else shutil.which("ffmpeg"))
         self.max_duration_s = max_duration_s
         self._cancel_requested = False
-        logger.debug("AudioMasker initialised (ffmpeg=%s, max_duration=%s)",
-                     self.ffmpeg_path, self.max_duration_s)
+        logger.debug("AudioMasker initialised (ffmpeg=%s [%s], max_duration=%s)",
+                     self.ffmpeg_path,
+                     self.ffmpeg_info.source if self.ffmpeg_info else "explicit",
+                     self.max_duration_s)
+
+    @property
+    def ffmpeg_available(self) -> bool:
+        """``True`` when an FFmpeg binary (bundled or system) is usable."""
+        return bool(self.ffmpeg_path)
+
+    @staticmethod
+    def prefers_ffmpeg(path: os.PathLike | str) -> bool:
+        """``True`` for compressed/video containers libsndfile cannot read."""
+        return Path(path).suffix.lower() in FFMPEG_PREFERRED_EXTENSIONS
 
     # ------------------------------------------------------------------ #
     # Public API
@@ -443,8 +518,9 @@ class AudioMasker:
 
         Returns a dict with keys ``duration`` (seconds, float), ``sr``,
         ``channels``, ``format`` (container name or ``""``) and ``size``
-        (bytes). Uses ``soundfile.info`` first, falls back to
-        ``librosa.get_duration`` (which can use audioread/FFmpeg).
+        (bytes). Uses ``soundfile.info`` first (skipped for FFmpeg-preferred
+        containers), then an ``ffmpeg -i`` metadata probe, then
+        ``librosa.get_duration`` as a last resort.
 
         Raises
         ------
@@ -462,17 +538,33 @@ class AudioMasker:
             raise AudioLoadError(f"File is empty (0 bytes): {p.name}")
 
         errors = []
-        try:
-            info = sf.info(str(p))
-            return {
-                "duration": float(info.duration),
-                "sr": int(info.samplerate),
-                "channels": int(info.channels),
-                "format": str(info.format),
-                "size": size,
-            }
-        except Exception as exc:  # noqa: BLE001
-            errors.append(f"soundfile: {exc}")
+        ext_fmt = p.suffix.lstrip(".").upper()
+        if not self.prefers_ffmpeg(p):
+            try:
+                info = sf.info(str(p))
+                return {
+                    "duration": float(info.duration),
+                    "sr": int(info.samplerate),
+                    "channels": int(info.channels),
+                    "format": str(info.format),
+                    "size": size,
+                }
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"soundfile: {exc}")
+
+        if self.ffmpeg_path:
+            meta = ffmpeg_locator.ffmpeg_probe(self.ffmpeg_path, p)
+            if meta and meta.get("sr", 0) > 0:
+                return {
+                    "duration": float(meta["duration"]),
+                    "sr": int(meta["sr"]),
+                    "channels": int(meta.get("channels", 0)),
+                    "format": (meta.get("codec") or ext_fmt).upper(),
+                    "size": size,
+                }
+            errors.append("ffmpeg: no decodable audio stream")
+        else:
+            errors.append("ffmpeg: not available")
 
         try:
             with warnings.catch_warnings():
@@ -482,7 +574,7 @@ class AudioMasker:
             if duration <= 0:
                 raise ValueError("zero duration")
             return {"duration": duration, "sr": sr, "channels": 0,
-                    "format": p.suffix.lstrip(".").upper(), "size": size}
+                    "format": ext_fmt, "size": size}
         except Exception as exc:  # noqa: BLE001
             errors.append(f"librosa: {exc}")
 
@@ -495,8 +587,14 @@ class AudioMasker:
         Decode an audio file to a float32 array.
 
         Returns ``(audio, sr)`` where ``audio`` is ``(n_samples,)`` for mono
-        or ``(n_channels, n_samples)`` otherwise. Tries, in order:
-        soundfile -> librosa/audioread -> FFmpeg transcode to temp WAV.
+        or ``(n_channels, n_samples)`` otherwise.
+
+        Decoder order
+        -------------
+        * Native containers (WAV/FLAC/OGG/MP3 ...):
+          soundfile -> FFmpeg (bundled/system) -> librosa/audioread
+        * Compressed / video containers (M4A/AAC/WMA/MP4/MKV ...):
+          FFmpeg (bundled/system) -> soundfile -> librosa/audioread
 
         Raises
         ------
@@ -514,50 +612,57 @@ class AudioMasker:
         self._enforce_duration_limit(path)
 
         errors = []
+        order = (["ffmpeg", "soundfile", "librosa"]
+                 if self.prefers_ffmpeg(path)
+                 else ["soundfile", "ffmpeg", "librosa"])
 
-        # Attempt 1: libsndfile (fast, handles WAV/FLAC/OGG, MP3 on new builds)
-        try:
-            data, sr = sf.read(str(path), dtype="float32", always_2d=True)
-            audio = data.T  # (channels, samples)
-            del data
-            return self._finalise_loaded(audio, sr)
-        except AudioLoadError:
-            raise
-        except MemoryError as exc:
-            raise AudioLoadError(
-                f"Not enough memory to load '{path.name}'.") from exc
-        except Exception as exc:  # noqa: BLE001 - try next decoder
-            errors.append(f"soundfile: {exc}")
-
-        # Attempt 2: librosa (may use audioread / ffmpeg under the hood)
-        try:
-            audio, sr = librosa.load(str(path), sr=None, mono=False)
-            return self._finalise_loaded(np.atleast_1d(audio), int(sr))
-        except AudioLoadError:
-            raise
-        except MemoryError as exc:
-            raise AudioLoadError(
-                f"Not enough memory to load '{path.name}'.") from exc
-        except Exception as exc:  # noqa: BLE001
-            errors.append(f"librosa: {exc}")
-
-        # Attempt 3: explicit FFmpeg transcode
-        if self.ffmpeg_path:
+        for backend in order:
             try:
-                audio, sr = self._load_via_ffmpeg(path)
+                if backend == "soundfile":
+                    result = self._load_via_soundfile(path)
+                elif backend == "ffmpeg":
+                    if not self.ffmpeg_path:
+                        errors.append("ffmpeg: binary not found (bundled or PATH)")
+                        continue
+                    result = self._load_via_ffmpeg(path)
+                else:
+                    result = self._load_via_librosa(path)
+                audio, sr = result
+                logger.debug("Decoded %s via %s", path.name, backend)
                 return self._finalise_loaded(audio, sr)
+            except MemoryError as exc:
+                raise AudioLoadError(
+                    f"Not enough memory to load '{path.name}'.") from exc
             except AudioLoadError as exc:
-                errors.append(f"ffmpeg: {exc}")
-            except Exception as exc:  # noqa: BLE001
-                errors.append(f"ffmpeg: {exc}")
-        else:
-            errors.append("ffmpeg: binary not found on PATH")
+                # Validation failures from _finalise_loaded (too long, empty)
+                # are final; decoder failures are recorded and we move on.
+                if getattr(exc, "_decoder_failure", False):
+                    errors.append(f"{backend}: {exc}")
+                    continue
+                raise
+            except Exception as exc:  # noqa: BLE001 - try next decoder
+                errors.append(f"{backend}: {exc}")
 
         raise AudioLoadError(
             f"Could not decode '{path.name}'. The file may be corrupt or the "
             f"codec is unsupported. {FFMPEG_HINT} "
             f"Details: " + " | ".join(errors)
         )
+
+    # -- individual decoders -------------------------------------------- #
+    @staticmethod
+    def _load_via_soundfile(path: Path) -> Tuple[np.ndarray, int]:
+        data, sr = sf.read(str(path), dtype="float32", always_2d=True)
+        audio = data.T  # (channels, samples)
+        del data
+        return audio, int(sr)
+
+    @staticmethod
+    def _load_via_librosa(path: Path) -> Tuple[np.ndarray, int]:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")  # audioread deprecation noise
+            audio, sr = librosa.load(str(path), sr=None, mono=False)
+        return np.atleast_1d(audio), int(sr)
 
     def write_audio(self, path: os.PathLike | str, audio: np.ndarray,
                     sr: int, fmt: str = "wav") -> Path:
@@ -726,9 +831,17 @@ class AudioMasker:
         ``self.max_duration_s``. Silently skips when duration is unknown."""
         if not self.max_duration_s:
             return
-        try:
-            duration = float(sf.info(str(path)).duration)
-        except Exception:  # noqa: BLE001
+        duration: Optional[float] = None
+        if not self.prefers_ffmpeg(path):
+            try:
+                duration = float(sf.info(str(path)).duration)
+            except Exception:  # noqa: BLE001
+                duration = None
+        if duration is None and self.ffmpeg_path:
+            meta = ffmpeg_locator.ffmpeg_probe(self.ffmpeg_path, path)
+            if meta and meta.get("duration", 0) > 0:
+                duration = float(meta["duration"])
+        if duration is None:
             try:
                 with warnings.catch_warnings():
                     warnings.simplefilter("ignore")
@@ -776,46 +889,55 @@ class AudioMasker:
 
     def _load_via_ffmpeg(self, path: Path) -> Tuple[np.ndarray, int]:
         """
-        Transcode to a temporary 32-bit float WAV and read it back.
+        Transcode (audio track only, ``-vn``) to a temporary 32-bit float
+        WAV and read it back. Works for every container/codec the bundled
+        FFmpeg understands, including video files.
 
-        Raises :class:`AudioLoadError` for a missing binary, timeout
-        (:data:`FFMPEG_TIMEOUT_S`), non-zero exit or unreadable output.
+        Raises :class:`AudioLoadError` (flagged as a decoder failure so
+        :meth:`load_audio` can try the next backend) for a missing binary,
+        timeout (:data:`FFMPEG_TIMEOUT_S`), non-zero exit or unreadable
+        output.
         """
         if not self.ffmpeg_path:
-            raise AudioLoadError("FFmpeg not available. " + FFMPEG_HINT)
+            raise _decoder_error("FFmpeg not available. " + FFMPEG_HINT)
         tmp_fd, tmp_name = tempfile.mkstemp(suffix=".wav", prefix="amask_")
         os.close(tmp_fd)
         try:
             cmd = [
                 self.ffmpeg_path, "-y", "-v", "error", "-nostdin",
                 "-i", str(path),
-                "-vn", "-acodec", "pcm_f32le", tmp_name,
+                "-vn", "-sn", "-dn",          # drop video/subtitle/data streams
+                "-map", "0:a:0?",              # first audio track only
+                "-acodec", "pcm_f32le", "-f", "wav", tmp_name,
             ]
             creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
             try:
                 proc = subprocess.run(  # noqa: S603
-                    cmd, capture_output=True, text=True,
+                    cmd, capture_output=True, text=True, errors="replace",
                     timeout=FFMPEG_TIMEOUT_S, creationflags=creationflags)
             except FileNotFoundError as exc:
-                raise AudioLoadError(
+                raise _decoder_error(
                     f"FFmpeg binary not found at '{self.ffmpeg_path}'. "
                     + FFMPEG_HINT) from exc
             except subprocess.TimeoutExpired as exc:
-                raise AudioLoadError(
+                raise _decoder_error(
                     f"FFmpeg timed out after {FFMPEG_TIMEOUT_S}s decoding "
                     f"'{path.name}'.") from exc
             except OSError as exc:
-                raise AudioLoadError(f"Could not launch FFmpeg: {exc}") from exc
+                raise _decoder_error(f"Could not launch FFmpeg: {exc}") from exc
             if proc.returncode != 0:
                 detail = (proc.stderr or "").strip().splitlines()
-                raise AudioLoadError(
+                raise _decoder_error(
                     f"FFmpeg failed (exit {proc.returncode}): "
                     f"{detail[-1] if detail else 'unknown error'}")
             try:
                 data, sr = sf.read(tmp_name, dtype="float32", always_2d=True)
             except Exception as exc:  # noqa: BLE001
-                raise AudioLoadError(
+                raise _decoder_error(
                     f"FFmpeg produced an unreadable file: {exc}") from exc
+            if data.size == 0:
+                raise _decoder_error(
+                    f"'{path.name}' contains no audio stream.")
             return data.T, int(sr)
         finally:
             try:
@@ -873,6 +995,7 @@ def _cli() -> int:  # pragma: no cover
 
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
                         format="%(levelname)s %(name)s: %(message)s")
+    print(ffmpeg_status())
 
     settings = MaskSettings(
         pitch_semitones=args.pitch,

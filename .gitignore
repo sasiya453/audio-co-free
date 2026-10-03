@@ -14,3 +14,8 @@ out/
 *.mp3
 *.flac
 !assets/**
+# bundled FFmpeg binary (fetched by tools/fetch_ffmpeg.py, ~100+ MB)
+bin/ffmpeg
+bin/ffmpeg.exe
+bin/ffprobe*
+bin/FFMPEG_LICENSE.txt

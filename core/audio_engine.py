@@ -37,6 +37,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import warnings
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Callable, Optional, Tuple
@@ -70,6 +71,8 @@ __all__ = [
     "AudioWriteError",
     "SUPPORTED_INPUT_EXTENSIONS",
     "SUPPORTED_OUTPUT_FORMATS",
+    "DEFAULT_MAX_DURATION_S",
+    "FFMPEG_HINT",
 ]
 
 logger = logging.getLogger("audiomask.engine")
@@ -91,6 +94,14 @@ SUPPORTED_OUTPUT_FORMATS = {
 }
 
 ProgressCallback = Callable[[float, str], None]
+
+#: Default guard against accidentally loading multi-hour recordings into RAM.
+DEFAULT_MAX_DURATION_S: float = 20 * 60.0
+#: Wall-clock limit for an external FFmpeg transcode.
+FFMPEG_TIMEOUT_S: int = 300
+#: Hint appended to decode failures for MP3/M4A style containers.
+FFMPEG_HINT = ("Install FFmpeg and add it to PATH to decode MP3/M4A/AAC "
+               "(https://ffmpeg.org/download.html).")
 
 
 # --------------------------------------------------------------------------- #
@@ -221,6 +232,9 @@ class AudioMasker:
         Explicit path to an FFmpeg binary used as a decoding fallback for
         formats libsndfile cannot open (notably MP3 on older builds). If
         ``None`` the engine searches ``PATH``.
+    max_duration_s : float | None
+        Reject inputs longer than this many seconds with
+        :class:`AudioLoadError` (memory guard). ``None`` disables the check.
     """
 
     #: Progress fractions emitted at each pipeline stage.
@@ -235,11 +249,15 @@ class AudioMasker:
     }
 
     def __init__(self, target_sr: Optional[int] = None,
-                 ffmpeg_path: Optional[str] = None) -> None:
+                 ffmpeg_path: Optional[str] = None,
+                 max_duration_s: Optional[float] = DEFAULT_MAX_DURATION_S
+                 ) -> None:
         self.target_sr = target_sr
         self.ffmpeg_path = ffmpeg_path or shutil.which("ffmpeg")
+        self.max_duration_s = max_duration_s
         self._cancel_requested = False
-        logger.debug("AudioMasker initialised (ffmpeg=%s)", self.ffmpeg_path)
+        logger.debug("AudioMasker initialised (ffmpeg=%s, max_duration=%s)",
+                     self.ffmpeg_path, self.max_duration_s)
 
     # ------------------------------------------------------------------ #
     # Public API
@@ -288,6 +306,11 @@ class AudioMasker:
 
         if not in_path.is_file():
             raise AudioLoadError(f"Input file not found: {in_path}")
+        try:
+            if in_path.stat().st_size == 0:
+                raise AudioLoadError(f"File is empty (0 bytes): {in_path.name}")
+        except OSError as exc:
+            raise AudioLoadError(f"Cannot access '{in_path}': {exc}") from exc
 
         logger.info("Processing %s -> %s with %s", in_path.name, out_dir,
                     settings.to_dict())
@@ -345,58 +368,124 @@ class AudioMasker:
         if y.ndim > 2:
             raise AudioEngineError(f"Unsupported array shape {y.shape}")
 
-        # 1. Time stretch ------------------------------------------------- #
-        self._check_cancel()
-        if abs(settings.speed_factor - 1.0) > 1e-4:
-            self._report(progress_cb, self._STAGES["load"],
-                         f"Time-stretching x{settings.speed_factor:.3f}")
-            y = self.time_stretch(y, settings.speed_factor)
-        self._report(progress_cb, self._STAGES["stretch"], "Time stretch done")
-
-        # 2. Pitch shift -------------------------------------------------- #
-        self._check_cancel()
-        if abs(settings.pitch_semitones) > 1e-4:
+        # Each stage rebinds ``y`` and explicitly drops the previous buffer so
+        # peak memory stays ~2x the signal size even for long files.
+        try:
+            # 1. Time stretch --------------------------------------------- #
+            self._check_cancel()
+            if abs(settings.speed_factor - 1.0) > 1e-4:
+                self._report(progress_cb, self._STAGES["load"],
+                             f"Time-stretching x{settings.speed_factor:.3f}")
+                y = self._swap(y, self.time_stretch(y, settings.speed_factor))
             self._report(progress_cb, self._STAGES["stretch"],
-                         f"Pitch-shifting {settings.pitch_semitones:+.2f} st")
-            y = self.pitch_shift(y, sr, settings.pitch_semitones)
-        self._report(progress_cb, self._STAGES["pitch"], "Pitch shift done")
+                         "Time stretch done")
 
-        # 3. Bandpass ----------------------------------------------------- #
-        self._check_cancel()
-        if settings.bandpass_enabled and settings.bandpass_intensity > 0:
-            self._report(progress_cb, self._STAGES["pitch"],
-                         "Applying Butterworth bandpass")
-            y = self.bandpass_filter(
-                y, sr,
-                settings.bandpass_low_hz,
-                settings.bandpass_high_hz,
-                mix=settings.bandpass_intensity,
-            )
-        self._report(progress_cb, self._STAGES["filter"], "Filter done")
+            # 2. Pitch shift ---------------------------------------------- #
+            self._check_cancel()
+            if abs(settings.pitch_semitones) > 1e-4:
+                self._report(progress_cb, self._STAGES["stretch"],
+                             f"Pitch-shifting {settings.pitch_semitones:+.2f} st")
+                y = self._swap(y, self.pitch_shift(y, sr,
+                                                   settings.pitch_semitones))
+            self._report(progress_cb, self._STAGES["pitch"], "Pitch shift done")
 
-        # 4. Micro-reverb ------------------------------------------------- #
-        self._check_cancel()
-        if settings.reverb_enabled and settings.reverb_mix > 0:
-            self._report(progress_cb, self._STAGES["filter"],
-                         "Rendering micro-reverb")
-            y = self.micro_reverb(
-                y, sr,
-                delay_ms=settings.reverb_delay_ms,
-                feedback=settings.reverb_feedback,
-                mix=settings.reverb_mix,
-            )
-        self._report(progress_cb, self._STAGES["reverb"], "Reverb done")
+            # 3. Bandpass ------------------------------------------------- #
+            self._check_cancel()
+            if settings.bandpass_enabled and settings.bandpass_intensity > 0:
+                self._report(progress_cb, self._STAGES["pitch"],
+                             "Applying Butterworth bandpass")
+                y = self._swap(y, self.bandpass_filter(
+                    y, sr,
+                    settings.bandpass_low_hz,
+                    settings.bandpass_high_hz,
+                    mix=settings.bandpass_intensity,
+                ))
+            self._report(progress_cb, self._STAGES["filter"], "Filter done")
 
-        # 5. Normalise ---------------------------------------------------- #
-        self._check_cancel()
-        y = self.normalize_peak(y, settings.normalize_peak_db)
-        self._report(progress_cb, self._STAGES["normalize"], "Normalised")
+            # 4. Micro-reverb --------------------------------------------- #
+            self._check_cancel()
+            if settings.reverb_enabled and settings.reverb_mix > 0:
+                self._report(progress_cb, self._STAGES["filter"],
+                             "Rendering micro-reverb")
+                y = self._swap(y, self.micro_reverb(
+                    y, sr,
+                    delay_ms=settings.reverb_delay_ms,
+                    feedback=settings.reverb_feedback,
+                    mix=settings.reverb_mix,
+                ))
+            self._report(progress_cb, self._STAGES["reverb"], "Reverb done")
 
-        return np.ascontiguousarray(y, dtype=np.float32)
+            # 5. Normalise ------------------------------------------------ #
+            self._check_cancel()
+            y = self._swap(y, self.normalize_peak(y, settings.normalize_peak_db))
+            self._report(progress_cb, self._STAGES["normalize"], "Normalised")
+
+            return np.ascontiguousarray(y, dtype=np.float32)
+        except MemoryError as exc:
+            raise AudioEngineError(
+                "Out of memory while processing - the file is too long for "
+                "the available RAM. Try a shorter file or close other "
+                "applications.") from exc
+        finally:
+            del y
+            gc.collect()
 
     # ------------------------------------------------------------------ #
     # I/O
     # ------------------------------------------------------------------ #
+    def probe(self, path: os.PathLike | str) -> dict:
+        """
+        Cheap pre-flight inspection without decoding the whole file.
+
+        Returns a dict with keys ``duration`` (seconds, float), ``sr``,
+        ``channels``, ``format`` (container name or ``""``) and ``size``
+        (bytes). Uses ``soundfile.info`` first, falls back to
+        ``librosa.get_duration`` (which can use audioread/FFmpeg).
+
+        Raises
+        ------
+        AudioLoadError
+            If the file is missing, empty or undecodable by every backend.
+        """
+        p = Path(path)
+        if not p.is_file():
+            raise AudioLoadError(f"Input file not found: {p}")
+        try:
+            size = p.stat().st_size
+        except OSError as exc:
+            raise AudioLoadError(f"Cannot access '{p}': {exc}") from exc
+        if size == 0:
+            raise AudioLoadError(f"File is empty (0 bytes): {p.name}")
+
+        errors = []
+        try:
+            info = sf.info(str(p))
+            return {
+                "duration": float(info.duration),
+                "sr": int(info.samplerate),
+                "channels": int(info.channels),
+                "format": str(info.format),
+                "size": size,
+            }
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"soundfile: {exc}")
+
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")  # audioread deprecation noise
+                duration = float(librosa.get_duration(path=str(p)))
+                sr = int(librosa.get_samplerate(str(p)))
+            if duration <= 0:
+                raise ValueError("zero duration")
+            return {"duration": duration, "sr": sr, "channels": 0,
+                    "format": p.suffix.lstrip(".").upper(), "size": size}
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"librosa: {exc}")
+
+        raise AudioLoadError(
+            f"Cannot read '{p.name}' - the file may be corrupt or use an "
+            f"unsupported codec. {FFMPEG_HINT} Details: " + " | ".join(errors))
+
     def load_audio(self, path: os.PathLike | str) -> Tuple[np.ndarray, int]:
         """
         Decode an audio file to a float32 array.
@@ -404,11 +493,21 @@ class AudioMasker:
         Returns ``(audio, sr)`` where ``audio`` is ``(n_samples,)`` for mono
         or ``(n_channels, n_samples)`` otherwise. Tries, in order:
         soundfile -> librosa/audioread -> FFmpeg transcode to temp WAV.
+
+        Raises
+        ------
+        AudioLoadError
+            Missing / empty / too-long / undecodable input.
         """
         path = Path(path)
+        if not path.is_file():
+            raise AudioLoadError(f"Input file not found: {path}")
         if path.suffix.lower() not in SUPPORTED_INPUT_EXTENSIONS:
             logger.warning("Unrecognised extension %s - attempting anyway",
                            path.suffix)
+
+        # Cheap duration guard before allocating anything large.
+        self._enforce_duration_limit(path)
 
         errors = []
 
@@ -416,7 +515,13 @@ class AudioMasker:
         try:
             data, sr = sf.read(str(path), dtype="float32", always_2d=True)
             audio = data.T  # (channels, samples)
+            del data
             return self._finalise_loaded(audio, sr)
+        except AudioLoadError:
+            raise
+        except MemoryError as exc:
+            raise AudioLoadError(
+                f"Not enough memory to load '{path.name}'.") from exc
         except Exception as exc:  # noqa: BLE001 - try next decoder
             errors.append(f"soundfile: {exc}")
 
@@ -424,6 +529,11 @@ class AudioMasker:
         try:
             audio, sr = librosa.load(str(path), sr=None, mono=False)
             return self._finalise_loaded(np.atleast_1d(audio), int(sr))
+        except AudioLoadError:
+            raise
+        except MemoryError as exc:
+            raise AudioLoadError(
+                f"Not enough memory to load '{path.name}'.") from exc
         except Exception as exc:  # noqa: BLE001
             errors.append(f"librosa: {exc}")
 
@@ -432,6 +542,8 @@ class AudioMasker:
             try:
                 audio, sr = self._load_via_ffmpeg(path)
                 return self._finalise_loaded(audio, sr)
+            except AudioLoadError as exc:
+                errors.append(f"ffmpeg: {exc}")
             except Exception as exc:  # noqa: BLE001
                 errors.append(f"ffmpeg: {exc}")
         else:
@@ -439,17 +551,33 @@ class AudioMasker:
 
         raise AudioLoadError(
             f"Could not decode '{path.name}'. The file may be corrupt or the "
-            f"codec is unsupported. Details: " + " | ".join(errors)
+            f"codec is unsupported. {FFMPEG_HINT} "
+            f"Details: " + " | ".join(errors)
         )
 
     def write_audio(self, path: os.PathLike | str, audio: np.ndarray,
                     sr: int, fmt: str = "wav") -> Path:
-        """Write ``audio`` to ``path`` using soundfile. Creates parent dirs."""
+        """
+        Write ``audio`` to ``path`` using soundfile. Creates parent dirs.
+
+        Raises
+        ------
+        AudioWriteError
+            Permission problems, locked files, full disks, unsupported
+            container/subtype combinations.
+        """
         path = Path(path)
         fmt = fmt.lower().lstrip(".")
         subtype = SUPPORTED_OUTPUT_FORMATS.get(fmt, "PCM_16")
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise AudioWriteError(
+                f"Cannot create output folder '{path.parent}': {exc}") from exc
+        if not os.access(path.parent, os.W_OK):
+            raise AudioWriteError(
+                f"Output folder is not writable: {path.parent}")
+        try:
             data = np.asarray(audio, dtype=np.float32)
             if data.ndim == 2:
                 data = data.T  # soundfile expects (samples, channels)
@@ -465,8 +593,26 @@ class AudioMasker:
             return path
         except AudioWriteError:
             raise
+        except PermissionError as exc:
+            raise AudioWriteError(
+                f"Permission denied writing '{path}'. If the file is open in "
+                f"a media player or another program, close it and retry. "
+                f"({exc})") from exc
+        except OSError as exc:
+            # errno 28 = ENOSPC; Windows sharing violations surface as OSError
+            hint = (" The disk may be full." if getattr(exc, "errno", None) == 28
+                    else " If the file is locked by another program, close it "
+                         "and retry.")
+            raise AudioWriteError(
+                f"Failed to write '{path}': {exc}.{hint}") from exc
         except Exception as exc:  # noqa: BLE001
             raise AudioWriteError(f"Failed to write '{path}': {exc}") from exc
+        finally:
+            # ``data`` may be a transposed view or a fresh copy; drop either.
+            try:
+                del data
+            except NameError:
+                pass
 
     # ------------------------------------------------------------------ #
     # DSP primitives (public so they can be unit-tested individually)
@@ -564,36 +710,108 @@ class AudioMasker:
     # ------------------------------------------------------------------ #
     # Internals
     # ------------------------------------------------------------------ #
-    def _finalise_loaded(self, audio: np.ndarray, sr: int) -> Tuple[np.ndarray, int]:
-        """Squeeze single-channel to 1-D, optionally resample, cast float32."""
+    @staticmethod
+    def _swap(old: np.ndarray, new: np.ndarray) -> np.ndarray:
+        """Return ``new`` after explicitly dropping ``old`` (memory hygiene)."""
+        if new is not old:
+            del old
+        return new
+
+    def _enforce_duration_limit(self, path: Path) -> None:
+        """Raise :class:`AudioLoadError` when the file exceeds
+        ``self.max_duration_s``. Silently skips when duration is unknown."""
+        if not self.max_duration_s:
+            return
+        try:
+            duration = float(sf.info(str(path)).duration)
+        except Exception:  # noqa: BLE001
+            try:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    duration = float(librosa.get_duration(path=str(path)))
+            except Exception:  # noqa: BLE001
+                return  # unknown - let the decoder decide
+        if duration > self.max_duration_s:
+            raise AudioLoadError(
+                f"'{path.name}' is {duration / 60:.1f} min long, which exceeds "
+                f"the {self.max_duration_s / 60:.0f} min limit. Split the "
+                f"file or raise max_duration_s.")
+
+    def _finalise_loaded(self, audio: np.ndarray,
+                         sr: int) -> Tuple[np.ndarray, int]:
+        """Cast to float32 (halves RAM vs float64), squeeze single-channel
+        to 1-D, scrub NaN/Inf, validate length and optionally resample."""
         audio = np.asarray(audio, dtype=np.float32)
         if audio.ndim == 2 and audio.shape[0] == 1:
             audio = audio[0]
-        if audio.size == 0:
-            raise AudioLoadError("Decoded audio is empty")
+        if audio.ndim == 0 or audio.size == 0 or audio.shape[-1] == 0:
+            raise AudioLoadError("File contains no audio")
+        if int(sr) <= 0:
+            raise AudioLoadError(f"Invalid sample rate {sr}")
+        if not np.all(np.isfinite(audio)):
+            logger.warning("Input contains NaN/Inf samples - replaced with 0")
+            audio = np.nan_to_num(audio, nan=0.0, posinf=0.0, neginf=0.0,
+                                  copy=False)
+        if self.max_duration_s:
+            duration = audio.shape[-1] / float(sr)
+            if duration > self.max_duration_s:
+                del audio
+                gc.collect()
+                raise AudioLoadError(
+                    f"Audio is {duration / 60:.1f} min long, which exceeds "
+                    f"the {self.max_duration_s / 60:.0f} min limit.")
         if self.target_sr and int(sr) != int(self.target_sr):
-            audio = librosa.resample(audio, orig_sr=int(sr),
-                                     target_sr=int(self.target_sr),
-                                     res_type="soxr_hq")
+            try:
+                audio = librosa.resample(audio, orig_sr=int(sr),
+                                         target_sr=int(self.target_sr),
+                                         res_type="soxr_hq")
+            except Exception as exc:  # noqa: BLE001
+                raise AudioLoadError(f"Resampling failed: {exc}") from exc
             sr = int(self.target_sr)
-        return audio, int(sr)
+        return np.ascontiguousarray(audio, dtype=np.float32), int(sr)
 
     def _load_via_ffmpeg(self, path: Path) -> Tuple[np.ndarray, int]:
-        """Transcode to a temporary 32-bit float WAV and read it back."""
+        """
+        Transcode to a temporary 32-bit float WAV and read it back.
+
+        Raises :class:`AudioLoadError` for a missing binary, timeout
+        (:data:`FFMPEG_TIMEOUT_S`), non-zero exit or unreadable output.
+        """
+        if not self.ffmpeg_path:
+            raise AudioLoadError("FFmpeg not available. " + FFMPEG_HINT)
         tmp_fd, tmp_name = tempfile.mkstemp(suffix=".wav", prefix="amask_")
         os.close(tmp_fd)
         try:
             cmd = [
-                self.ffmpeg_path, "-y", "-v", "error",
+                self.ffmpeg_path, "-y", "-v", "error", "-nostdin",
                 "-i", str(path),
                 "-vn", "-acodec", "pcm_f32le", tmp_name,
             ]
             creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-            proc = subprocess.run(cmd, capture_output=True, text=True,
-                                  timeout=600, creationflags=creationflags)
+            try:
+                proc = subprocess.run(  # noqa: S603
+                    cmd, capture_output=True, text=True,
+                    timeout=FFMPEG_TIMEOUT_S, creationflags=creationflags)
+            except FileNotFoundError as exc:
+                raise AudioLoadError(
+                    f"FFmpeg binary not found at '{self.ffmpeg_path}'. "
+                    + FFMPEG_HINT) from exc
+            except subprocess.TimeoutExpired as exc:
+                raise AudioLoadError(
+                    f"FFmpeg timed out after {FFMPEG_TIMEOUT_S}s decoding "
+                    f"'{path.name}'.") from exc
+            except OSError as exc:
+                raise AudioLoadError(f"Could not launch FFmpeg: {exc}") from exc
             if proc.returncode != 0:
-                raise AudioLoadError(proc.stderr.strip() or "ffmpeg failed")
-            data, sr = sf.read(tmp_name, dtype="float32", always_2d=True)
+                detail = (proc.stderr or "").strip().splitlines()
+                raise AudioLoadError(
+                    f"FFmpeg failed (exit {proc.returncode}): "
+                    f"{detail[-1] if detail else 'unknown error'}")
+            try:
+                data, sr = sf.read(tmp_name, dtype="float32", always_2d=True)
+            except Exception as exc:  # noqa: BLE001
+                raise AudioLoadError(
+                    f"FFmpeg produced an unreadable file: {exc}") from exc
             return data.T, int(sr)
         finally:
             try:

@@ -21,25 +21,34 @@ from __future__ import annotations
 import logging
 import os
 import queue
+import subprocess
+import sys
 import threading
 import time
+import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import customtkinter as ctk
 
 from core.audio_engine import (
     SUPPORTED_INPUT_EXTENSIONS,
     AudioEngineError,
+    AudioLoadError,
     AudioMasker,
     MaskSettings,
 )
 
+try:  # optional - logging module may be absent in stripped-down builds
+    from core.logging_setup import open_log_folder as _open_log_folder
+except Exception:  # noqa: BLE001
+    _open_log_folder = None  # type: ignore[assignment]
+
 logger = logging.getLogger("audiomask.ui")
 
 APP_TITLE = "AudioMask Pro"
-APP_VERSION = "0.2.0"
+APP_VERSION = "0.3.0"
 WINDOW_SIZE = (880, 800)
 MIN_SIZE = (800, 720)
 POLL_MS = 100
@@ -71,6 +80,85 @@ MSG_FILE_START = "fs"      # payload: (index:int, total:int, name:str)
 MSG_FILE_DONE = "fd"       # payload: (index:int, total:int, out_path:str)
 MSG_FILE_ERROR = "fe"      # payload: (index:int, total:int, name:str, err:str)
 MSG_BATCH_DONE = "bd"      # payload: (ok:int, failed:int, cancelled:bool)
+
+
+# --------------------------------------------------------------------------- #
+# Pure helpers (no Tk) - unit-tested in tests/test_ui_logic.py
+# --------------------------------------------------------------------------- #
+def settings_from_values(pitch: float, speed: float, reverb_on: bool,
+                         reverb_mix: float, bp_on: bool, bp_int: float,
+                         fmt: str) -> MaskSettings:
+    """
+    Build a validated :class:`MaskSettings` from raw widget values.
+
+    Rounding mirrors the slider resolution so settings logged / persisted
+    are stable (no 1.0300000001 artefacts).
+    """
+    s = MaskSettings(
+        pitch_semitones=round(float(pitch), 2),
+        speed_factor=round(float(speed), 3),
+        reverb_enabled=bool(reverb_on),
+        reverb_mix=round(float(reverb_mix), 3),
+        bandpass_enabled=bool(bp_on),
+        bandpass_intensity=round(float(bp_int), 3),
+        output_format=str(fmt),
+    )
+    return s.validate()
+
+
+def predict_output_path(src: Path, out_dir: Path,
+                        settings: MaskSettings) -> Path:
+    """First-choice output path (before collision suffixing) for ``src``."""
+    return out_dir / f"{src.stem}{settings.output_suffix}.{settings.output_format}"
+
+
+def find_overwrite_conflicts(files: List[Path], out_dir: Path,
+                             settings: MaskSettings) -> List[Path]:
+    """
+    Return input files whose *first-choice* output path already exists.
+
+    The engine itself never overwrites (it appends ``_1``, ``_2`` ...), but
+    the user should know a duplicate will be created - especially when the
+    output folder equals the input folder.
+    """
+    conflicts: List[Path] = []
+    for f in files:
+        try:
+            target = predict_output_path(f, out_dir, settings)
+            if target.exists() or target.resolve() == f.resolve():
+                conflicts.append(f)
+        except OSError:
+            continue
+    return conflicts
+
+
+def dir_is_writable(path: Path) -> bool:
+    """True if ``path`` is (or can be created as) a writable directory."""
+    try:
+        if path.exists():
+            return path.is_dir() and os.access(path, os.W_OK)
+        # Walk up to the nearest existing parent and check that instead.
+        parent = path
+        while not parent.exists() and parent.parent != parent:
+            parent = parent.parent
+        return parent.is_dir() and os.access(parent, os.W_OK)
+    except OSError:
+        return False
+
+
+def open_in_file_browser(path: Path) -> bool:
+    """Reveal ``path`` with the OS file browser. Never raises."""
+    try:
+        if sys.platform.startswith("win"):
+            os.startfile(str(path))  # type: ignore[attr-defined]  # noqa: S606
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", str(path)])  # noqa: S603,S607
+        else:
+            subprocess.Popen(["xdg-open", str(path)])  # noqa: S603,S607
+        return True
+    except Exception:  # noqa: BLE001
+        logger.warning("Could not open %s in file browser", path, exc_info=True)
+        return False
 
 
 class _GlassFrame(ctk.CTkFrame):
@@ -107,13 +195,16 @@ class AudioMaskApp(ctk.CTk):
         self._worker: Optional[threading.Thread] = None
         self._queue: "queue.Queue[tuple]" = queue.Queue()
         self._running = False
+        self._closing = False
         self._cancel_flag = threading.Event()
         self._controls: list = []  # widgets disabled while processing
+        self._last_output_dir: Optional[Path] = None
+        self._poll_id: Optional[str] = None
 
         self._configure_window()
         self._build_layout()
         self._apply_defaults()
-        self.after(POLL_MS, self._poll_queue)
+        self._poll_id = self.after(POLL_MS, self._poll_queue)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.log(f"{APP_TITLE} v{APP_VERSION} ready.")
         if not self.masker.ffmpeg_path:
@@ -158,10 +249,17 @@ class AudioMaskApp(ctk.CTk):
                      font=ctk.CTkFont(size=12)
                      ).grid(row=1, column=0, sticky="w")
 
+        self.btn_logs = ctk.CTkButton(
+            hdr, text="Open log folder", width=120, height=26,
+            fg_color=_PANEL_ALT, hover_color=_BORDER,
+            font=ctk.CTkFont(size=11), command=self._open_logs)
+        self.btn_logs.grid(row=0, column=1, rowspan=2, sticky="e",
+                           padx=(0, 12))
+
         self.theme_switch = ctk.CTkSwitch(
             hdr, text="Dark", command=self._toggle_theme, width=80)
         self.theme_switch.select()
-        self.theme_switch.grid(row=0, column=1, rowspan=2, sticky="e")
+        self.theme_switch.grid(row=0, column=2, rowspan=2, sticky="e")
 
     # -- source files ---------------------------------------------------- #
     def _build_source_panel(self) -> None:
@@ -323,8 +421,14 @@ class AudioMaskApp(ctk.CTk):
             state="disabled", command=self._cancel_processing)
         self.btn_cancel.grid(row=0, column=1, padx=8, pady=12)
 
+        self.btn_open_out = ctk.CTkButton(
+            panel, text="Open output", width=110, height=38,
+            fg_color=_PANEL_ALT, hover_color=_BORDER,
+            state="disabled", command=self._open_output_folder)
+        self.btn_open_out.grid(row=0, column=3, padx=(8, 16), pady=12)
+
         prog = ctk.CTkFrame(panel, fg_color="transparent")
-        prog.grid(row=0, column=2, sticky="ew", padx=(8, 16), pady=12)
+        prog.grid(row=0, column=2, sticky="ew", padx=8, pady=12)
         prog.grid_columnconfigure(0, weight=1)
 
         self.lbl_batch = ctk.CTkLabel(prog, text="Idle", anchor="w",
@@ -399,16 +503,15 @@ class AudioMaskApp(ctk.CTk):
 
     def build_settings(self) -> MaskSettings:
         """Snapshot the current widget values into a validated MaskSettings."""
-        s = MaskSettings(
-            pitch_semitones=round(float(self.sl_pitch.get()), 2),
-            speed_factor=round(float(self.sl_speed.get()), 3),
-            reverb_enabled=bool(self.sw_reverb.get()),
-            reverb_mix=round(float(self.sl_reverb.get()), 3),
-            bandpass_enabled=bool(self.sw_bandpass.get()),
-            bandpass_intensity=round(float(self.sl_bandpass.get()), 3),
-            output_format=self.om_format.get(),
+        return settings_from_values(
+            pitch=self.sl_pitch.get(),
+            speed=self.sl_speed.get(),
+            reverb_on=self.sw_reverb.get(),
+            reverb_mix=self.sl_reverb.get(),
+            bp_on=self.sw_bandpass.get(),
+            bp_int=self.sl_bandpass.get(),
+            fmt=self.om_format.get(),
         )
-        return s.validate()
 
     # ------------------------------------------------------------------ #
     # File selection
@@ -484,8 +587,46 @@ class AudioMaskApp(ctk.CTk):
 
         files = list(self._files)
         out_dir = self._effective_output_dir(files[0])
+
+        # -- pre-flight checks (main thread, cheap) -----------------------
+        if not dir_is_writable(out_dir):
+            messagebox.showerror(
+                APP_TITLE, f"The output folder is not writable:\n{out_dir}\n\n"
+                           "Choose a different folder.")
+            return
+
+        files, skipped = self._preflight_probe(files)
+        if skipped:
+            lines = "\n".join(f"- {n}: {why}" for n, why in skipped[:8])
+            more = f"\n... and {len(skipped) - 8} more" if len(skipped) > 8 else ""
+            if not files:
+                messagebox.showerror(
+                    APP_TITLE, "None of the selected files can be read:\n\n"
+                               f"{lines}{more}")
+                return
+            if not messagebox.askyesno(
+                    APP_TITLE,
+                    f"{len(skipped)} file(s) cannot be read and will be "
+                    f"skipped:\n\n{lines}{more}\n\nContinue with the remaining "
+                    f"{len(files)} file(s)?"):
+                return
+
+        conflicts = find_overwrite_conflicts(files, out_dir, settings)
+        if conflicts:
+            names = "\n".join(f"- {c.name}" for c in conflicts[:8])
+            more = (f"\n... and {len(conflicts) - 8} more"
+                    if len(conflicts) > 8 else "")
+            if not messagebox.askyesno(
+                    APP_TITLE,
+                    f"Output files already exist in\n{out_dir}\nfor:\n\n"
+                    f"{names}{more}\n\nExisting files will be kept and new "
+                    "ones get a numeric suffix (_1, _2 ...). Continue?"):
+                return
+
         self._set_running(True)
         self._cancel_flag.clear()
+        self._last_output_dir = None
+        self.btn_open_out.configure(state="disabled")
         self.pb_file.set(0)
         self.pb_total.set(0)
         self.log(f"Starting batch: {len(files)} file(s) -> {out_dir}")
@@ -502,6 +643,31 @@ class AudioMaskApp(ctk.CTk):
             name="AudioMaskWorker", daemon=True)
         self._worker.start()
 
+    def _preflight_probe(self, files: List[Path]
+                         ) -> Tuple[List[Path], List[Tuple[str, str]]]:
+        """Probe each file; return ``(readable, [(name, reason), ...])``."""
+        good: List[Path] = []
+        bad: List[Tuple[str, str]] = []
+        for f in files:
+            try:
+                info = self.masker.probe(f)
+                limit = self.masker.max_duration_s
+                if limit and info["duration"] > limit:
+                    raise AudioLoadError(
+                        f"{info['duration'] / 60:.1f} min exceeds the "
+                        f"{limit / 60:.0f} min limit")
+                good.append(f)
+                self.log(f"OK  {f.name}: {info['duration']:.1f}s @ "
+                         f"{info['sr']} Hz, {info['channels'] or '?'} ch")
+            except AudioEngineError as exc:
+                bad.append((f.name, str(exc).split(" Details:")[0]))
+                self.log(f"SKIP {f.name}: {exc}")
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("probe failed for %s", f)
+                bad.append((f.name, f"unexpected error: {exc!r}"))
+                self.log(f"SKIP {f.name}: {exc!r}")
+        return good, bad
+
     def _worker_main(self, files: List[Path], out_dir: Path,
                      settings: MaskSettings) -> None:
         """Runs on the background thread. Communicates ONLY via the queue."""
@@ -510,11 +676,13 @@ class AudioMaskApp(ctk.CTk):
         cancelled = False
 
         def progress(frac: float, msg: str) -> None:
+            if self._closing:
+                return
             self._queue.put((MSG_FILE_PROGRESS, frac))
             self._queue.put((MSG_LOG, f"    [{frac * 100:3.0f}%] {msg}"))
 
         for idx, path in enumerate(files, start=1):
-            if self._cancel_flag.is_set():
+            if self._cancel_flag.is_set() or self._closing:
                 cancelled = True
                 break
             self._queue.put((MSG_FILE_START, (idx, total, path.name)))
@@ -536,6 +704,7 @@ class AudioMaskApp(ctk.CTk):
                                  (idx, total, path.name, str(exc))))
             except MemoryError:
                 failed += 1
+                logger.error("MemoryError processing %s", path)
                 self._queue.put((MSG_FILE_ERROR,
                                  (idx, total, path.name,
                                   "Out of memory - file too large to process.")))
@@ -546,6 +715,8 @@ class AudioMaskApp(ctk.CTk):
                                  (idx, total, path.name,
                                   f"Unexpected error: {exc!r}")))
 
+        if ok:
+            self._last_output_dir = out_dir
         self._queue.put((MSG_BATCH_DONE, (ok, failed, cancelled)))
 
     def _cancel_processing(self) -> None:
@@ -560,18 +731,35 @@ class AudioMaskApp(ctk.CTk):
     # Queue polling (main thread)
     # ------------------------------------------------------------------ #
     def _poll_queue(self) -> None:
+        if self._closing:
+            return
         try:
             for _ in range(200):  # bounded drain per tick keeps UI smooth
                 kind, payload = self._queue.get_nowait()
                 self._handle_message(kind, payload)
         except queue.Empty:
             pass
+        except tk.TclError:
+            # Widgets destroyed mid-update (window closing) - stop polling.
+            logger.debug("TclError during poll; UI is shutting down")
+            return
         except Exception:  # noqa: BLE001
             logger.exception("Error while handling worker message")
         finally:
-            self.after(POLL_MS, self._poll_queue)
+            if not self._closing:
+                try:
+                    self._poll_id = self.after(POLL_MS, self._poll_queue)
+                except tk.TclError:
+                    pass
 
     def _handle_message(self, kind: str, payload) -> None:
+        try:
+            self._dispatch_message(kind, payload)
+        except tk.TclError as exc:
+            if not self._closing:
+                logger.debug("TclError handling %s: %s", kind, exc)
+
+    def _dispatch_message(self, kind: str, payload) -> None:
         if kind == MSG_LOG:
             self.log(payload)
         elif kind == MSG_FILE_PROGRESS:
@@ -602,7 +790,9 @@ class AudioMaskApp(ctk.CTk):
                   "Completed" if failed == 0 else "Completed with errors")
         self.lbl_batch.configure(text=f"{status}: {ok} ok, {failed} failed")
         self.log(f"Batch {status.lower()}: {ok} succeeded, {failed} failed.")
-        if cancelled:
+        if ok and self._last_output_dir:
+            self.btn_open_out.configure(state="normal")
+        if cancelled or self._closing:
             return
         if failed and ok == 0:
             messagebox.showerror(
@@ -637,23 +827,70 @@ class AudioMaskApp(ctk.CTk):
     def _toggle_theme(self) -> None:
         ctk.set_appearance_mode("dark" if self.theme_switch.get() else "light")
 
+    def _open_logs(self) -> None:
+        ok = bool(_open_log_folder and _open_log_folder())
+        self.log("Opened log folder." if ok else
+                 "Could not open the log folder (see console/stderr).")
+
+    def _open_output_folder(self) -> None:
+        target = self._last_output_dir
+        if not target or not target.exists():
+            self.log("Output folder is not available.")
+            return
+        if not open_in_file_browser(target):
+            self.log(f"Could not open {target}")
+
     def log(self, message: str) -> None:
         """Append a timestamped line to the console (main thread only)."""
-        stamp = time.strftime("%H:%M:%S")
-        self.console.configure(state="normal")
-        self.console.insert("end", f"[{stamp}] {message}\n")
-        self.console.see("end")
-        self.console.configure(state="disabled")
         logger.info(message)
+        if self._closing:
+            return
+        stamp = time.strftime("%H:%M:%S")
+        try:
+            self.console.configure(state="normal")
+            self.console.insert("end", f"[{stamp}] {message}\n")
+            self.console.see("end")
+            self.console.configure(state="disabled")
+        except tk.TclError:
+            pass  # console already destroyed
+
+    def shutdown(self) -> None:
+        """Idempotent teardown: stop polling, signal the worker, drop buffers.
+        Safe to call multiple times and after ``destroy()``."""
+        if self._closing:
+            return
+        self._closing = True
+        self._cancel_flag.set()
+        try:
+            self.masker.cancel()
+        except Exception:  # noqa: BLE001
+            pass
+        if self._poll_id is not None:
+            try:
+                self.after_cancel(self._poll_id)
+            except Exception:  # noqa: BLE001
+                pass
+            self._poll_id = None
+        worker = self._worker
+        if worker is not None and worker.is_alive():
+            worker.join(timeout=2.0)  # pipeline checks cancel between stages
+        # Drain any leftover messages so references to payloads are released.
+        try:
+            while True:
+                self._queue.get_nowait()
+        except queue.Empty:
+            pass
 
     def _on_close(self) -> None:
         if self._running:
             if not messagebox.askyesno(
                     APP_TITLE, "Processing is still running. Cancel and quit?"):
                 return
-            self._cancel_flag.set()
-            self.masker.cancel()
-        self.destroy()
+        self.shutdown()
+        try:
+            self.destroy()
+        except tk.TclError:
+            pass
 
 
 def run() -> None:

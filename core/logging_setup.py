@@ -169,7 +169,11 @@ def log_environment(logger: Optional[logging.Logger] = None) -> None:
             log.info("libsndfile %s", sf.__libsndfile_version__)
         except Exception:  # noqa: BLE001
             pass
-        log.info("ffmpeg: %s", shutil.which("ffmpeg") or "not on PATH")
+        try:
+            from core import ffmpeg_locator
+            log.info("%s", ffmpeg_locator.describe())
+        except Exception:  # noqa: BLE001 - locator import must never break startup
+            log.info("ffmpeg: %s", shutil.which("ffmpeg") or "not on PATH")
         if _active_log_path:
             log.info("Log file: %s", _active_log_path)
     except Exception:  # noqa: BLE001 - diagnostics must never break startup

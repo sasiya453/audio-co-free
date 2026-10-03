@@ -18,7 +18,7 @@
 | Run app | `python main.py` (set `AUDIOMASK_DEBUG=1` for debug console) |
 | Headless check | `python main.py --selftest` (also works on the frozen exe) |
 | Log file | `%LOCALAPPDATA%\AudioMaskPro\logs\audiomask.log` (Win) / `~/.audiomask/logs/` (other) |
-| Tests | `python -m unittest discover -s tests` (**93 tests, ~15-40 s**, no display needed; needs `ffmpeg` on PATH to build fixtures, else format tests skip) |
+| Tests | `python -m unittest discover -s tests` (**102 tests, ~15-40 s**, no display needed; needs `ffmpeg` on PATH to build fixtures, else format tests skip; `pip install customtkinter` else 9 UI-helper tests skip) |
 | CLI smoke | `python -m core.audio_engine song.mp3 -o out -p 1.5 -s 1.05` |
 | Build (Windows) | `build.bat` → `dist\AudioMaskPro\AudioMaskPro.exe` (`build.bat onefile` / `console` / `clean`) |
 | Build (sandbox) | `./build.sh smoke` or `pyinstaller --noconfirm --clean build.spec && dist/AudioMaskPro/AudioMaskPro --selftest` |
@@ -43,8 +43,8 @@
 | # | Task | Status |
 |---|---|---|
 | F1 | Bundled FFmpeg integration + audio loader hardening (`core/ffmpeg_locator.py`, `core/audio_engine.py`, `bin/`, `tools/fetch_ffmpeg.py`, `tests/test_formats.py`) | ✅ **DONE (session 5)** |
-| F2 | UI status banner + auto-detection (`ui/app_ui.py`): `[INFO] FFmpeg backend: Bundled/Found`, file dialog accepts all `SUPPORTED_INPUT_EXTENSIONS` | 🔶 **NEXT** |
-| F3 | `build.spec` bundles `bin/ffmpeg.exe`; `build.bat` fetches it + runs `--selftest`; bump `APP_VERSION` → 1.1.0; README | ⏳ pending |
+| F2 | UI status banner + auto-detection (`ui/app_ui.py`): `[INFO] FFmpeg backend: Bundled/Found`, file dialog accepts all `SUPPORTED_INPUT_EXTENSIONS` | ✅ **DONE (session 6)** |
+| F3 | `build.spec` bundles `bin/ffmpeg.exe`; `build.bat` fetches it + runs `--selftest`; bump `APP_VERSION` → 1.1.0; README | 🔶 **NEXT** |
 
 ---
 
@@ -59,7 +59,7 @@ core/logging_setup.py     # configure_logging / log_environment / open_log_folde
 bin/README.md             # bundled FFmpeg folder; ffmpeg(.exe) is git-ignored, fetched by tools/fetch_ffmpeg.py (F1)
 tools/fetch_ffmpeg.py     # downloads static BtbN FFmpeg build (win64/linux64) into bin/; --check / --force / --lgpl (F1)
 ui/__init__.py
-ui/app_ui.py              # AudioMaskApp(ctk.CTk) v1.0.0 + pure helpers  (Task 2, hardened Task 3)
+ui/app_ui.py              # AudioMaskApp(ctk.CTk) v1.0.0 + pure helpers  (Task 2, hardened Task 3, FFmpeg banner + universal dialog F2)
 hooks/rthook_numba.py     # PyInstaller runtime hook: NUMBA_CACHE_DIR/LIBROSA_DATA_DIR -> %TEMP% (Task 4)
 build.spec                # PyInstaller spec, one-folder default; ONEFILE=1 / CONSOLE=1 env switches (Task 4)
 build.bat                 # Windows build: venv -> deps -> tests -> pyinstaller (Task 4)
@@ -67,7 +67,7 @@ build.sh                  # POSIX spec validation incl. Xvfb smoke (Task 4)
 README.md                 # user + developer documentation (Task 4)
 tests/__init__.py
 tests/test_engine.py      # 31 DSP/engine tests (synthetic signals)
-tests/test_ui_logic.py    # 28 tests: logging, hardening paths, UI helpers (no Tk)
+tests/test_ui_logic.py    # 37 tests: logging, hardening paths, UI helpers incl. FFmpeg banner / dialog filetypes / add_files (no Tk)
 tests/test_formats.py     # 34 tests: locator + M4A/AAC/OGG/Opus/FLAC/WMA/MP3/MP4/MKV/MOV/WebM decode via *bundled-only* FFmpeg (F1)
 requirements.txt
 .gitignore
@@ -168,43 +168,63 @@ masker.cancel()                             # thread-safe; raises AudioEngineErr
 
 ---
 
-## 🔶 NEXT PENDING TASK — F2: UI status & FFmpeg auto-detection banner (`ui/app_ui.py`)
+## What Task F2 delivered (session 6)
 
-1. In `AudioMaskApp.__init__` replace the `if not self.masker.ffmpeg_path:` warning
-   (around line 210) with:
-   ```python
-   info = self.masker.ffmpeg_info
-   if self.masker.ffmpeg_available:
-       self.log(f"[INFO] FFmpeg backend: {info.label if info else 'Found'} -> {self.masker.ffmpeg_path}")
-   else:
-       self.log("[WARN] FFmpeg backend: not found - M4A/AAC/WMA/MP4 decoding disabled. "
-                "Reinstall the app (bin/ffmpeg.exe) or install FFmpeg.")
-   ```
-   (`self.log` already prefixes; check how it formats before adding `[INFO]`.)
-2. Make the file-open dialog's `filetypes` use `SUPPORTED_INPUT_EXTENSIONS`
-   (add an "All media" entry with every extension and separate "Audio"/"Video"
-   groups). Grep `filedialog.askopenfilenames` in `ui/app_ui.py`.
-3. If the UI filters dropped/selected files by extension, use
-   `SUPPORTED_INPUT_EXTENSIONS` (not a hard-coded list) and never reject unknown
-   extensions outright — the engine attempts them.
-4. `core/logging_setup.py::log_environment` line ~172: replace the
-   `shutil.which("ffmpeg")` log with `ffmpeg_locator.describe()`.
-5. Add 2-4 tests to `tests/test_ui_logic.py` (pure helpers only, no Tk) and
-   extend any existing dialog-filter helper test. Run full suite, commit, update
-   this file (mark F2 done, activate F3), push.
+* **`ui/app_ui.py`** — new pure helpers (Tk-free, unit-tested):
+  * `ffmpeg_status_line(masker) -> (message, available)` →
+    `"[INFO] FFmpeg backend: Bundled (7.1) -> …\_internal\bin\ffmpeg.exe"` /
+    `"[INFO] FFmpeg backend: System PATH (6.0) -> /usr/bin/ffmpeg"` /
+    `"[INFO] FFmpeg backend: Found -> <explicit path>"` /
+    `"[WARN] FFmpeg backend: not found - M4A/AAC/WMA/MP4 decoding disabled. Reinstall the app (bin/ffmpeg.exe) or install FFmpeg and add it to PATH."`
+  * `build_file_dialog_filetypes()` — Tk `filetypes` built from the engine
+    tables: **"All media (audio + video)"** (default, every
+    `SUPPORTED_INPUT_EXTENSIONS`), "Audio - uncompressed / lossless"
+    (`NATIVE_INPUT_EXTENSIONS`), "Audio - compressed (M4A, AAC, WMA ...)"
+    (`COMPRESSED_INPUT_EXTENSIONS`), "Video (audio track extracted)"
+    (`VIDEO_CONTAINER_EXTENSIONS`), "All files".
+  * `classify_input_path(path) -> "supported" | "unknown"` — informational only.
+* `AudioMaskApp.__init__` now calls `_log_ffmpeg_status()` (old "FFmpeg not
+  found on PATH" note removed); when available it also logs
+  `Universal input enabled: WAV/FLAC/OGG/MP3 plus M4A, AAC, WMA, Opus and video containers (MP4/MKV/MOV/WebM).`
+* New `AudioMaskApp.add_files(paths) -> int` shared by `_pick_files` (and any
+  future drag-and-drop): **never rejects by extension** — unknown extensions
+  get a console hint and are still queued (engine/FFmpeg sniffs the container);
+  folders are skipped; duplicates ignored.
+* **`core/logging_setup.py::log_environment`** logs `ffmpeg_locator.describe()`
+  (falls back to `shutil.which` only if the locator import fails).
+* **Tests:** +9 in `tests/test_ui_logic.py` (banner variants, dialog filetypes
+  cover every supported ext incl. `.m4a .aac .wma .ogg .flac .mp4 .mkv`,
+  classify, `add_files` without a Tk window, `log_environment` emits
+  `FFmpeg backend:`). **102/102 green.**
+* **Verified under Xvfb:** console shows
+  `[INFO] FFmpeg backend: System PATH (7.1.5…) -> /usr/bin/ffmpeg` and, with
+  `PATH` emptied inside the process, the `[WARN] … not found` line.
 
-### Then F3 (packaging)
-* `build.spec`: if `bin/ffmpeg.exe` (win) / `bin/ffmpeg` (posix) exists add it to
-  `binaries` as `(path, "bin")` → lands in `_internal/bin/` (one-folder) or
-  `_MEIPASS/bin/` (one-file) — both already in the locator search list. Also add
-  `bin/FFMPEG_LICENSE.txt` to `datas` when present. Warn loudly (not fail) if missing.
-* `build.bat`: call `python tools\fetch_ffmpeg.py --platform win64` before
-  PyInstaller; after build run `dist\AudioMaskPro\AudioMaskPro.exe --selftest`
-  and fail on non-zero exit. `build.sh`: same with linux64.
-* `main.py --selftest`: additionally print `ffmpeg_status()` and, if FFmpeg is
-  available, round-trip a synthesized tone through `ffmpeg -> .m4a -> load_audio`.
-* Bump `APP_VERSION` to 1.1.0, update README (FFmpeg no longer optional for
-  users; bundled), mark F3 done here.
+---
+
+## 🔶 NEXT PENDING TASK — F3: packaging (`build.spec`, `build.bat`, `build.sh`, `main.py`, README)
+
+1. **`build.spec`**: if `bin/ffmpeg.exe` (win) / `bin/ffmpeg` (posix) exists add it to
+   `binaries` as `(str(path), "bin")` → lands in `_internal/bin/` (one-folder) or
+   `_MEIPASS/bin/` (one-file) — both already in `core/ffmpeg_locator.candidate_paths`.
+   Also add `bin/FFMPEG_LICENSE.txt` to `datas` as `(path, "bin")` when present.
+   Print a loud `WARNING: bin/ffmpeg(.exe) missing - run tools/fetch_ffmpeg.py`
+   (do NOT fail the build) if absent.
+2. **`build.bat`**: before PyInstaller run `python tools\fetch_ffmpeg.py --platform win64`
+   (skip when `bin\ffmpeg.exe` exists; `--check` is available). After the build run
+   `dist\AudioMaskPro\AudioMaskPro.exe --selftest` (or the one-file exe) and
+   `exit /b 1` on non-zero. Also verify `dist\AudioMaskPro\_internal\bin\ffmpeg.exe` exists.
+   **`build.sh`**: same with `--platform linux64`.
+3. **`main.py --selftest`**: print `ffmpeg_status()`; if FFmpeg is available,
+   round-trip a synthesised tone `wav -> ffmpeg -> .m4a -> AudioMasker.load_audio`
+   (use `tempfile`; treat failure as exit 3). Keep exit codes 0/3.
+4. Bump `ui/app_ui.py::APP_VERSION` to **1.1.0**; README: FFmpeg is bundled
+   (no user install), list supported inputs incl. video containers, mention
+   `tools/fetch_ffmpeg.py` + licence note (BtbN GPL build; `--lgpl` option).
+5. Sandbox validation: `python tools/fetch_ffmpeg.py --platform linux64`,
+   `pip install pyinstaller`, `pyinstaller --noconfirm --clean build.spec`,
+   `ls dist/AudioMaskPro/_internal/bin/ffmpeg`, `PATH=/nonexistent dist/AudioMaskPro/AudioMaskPro --selftest`
+   (must report `Bundled`). Run tests, commit, mark F3 done here, push.
 
 ### Windows first-run checklist (do this if the user reports build problems)
 1. `build.bat console` → run `dist\AudioMaskPro\AudioMaskPro.exe --selftest` and read the traceback.
@@ -238,5 +258,6 @@ pyinstaller --noconfirm --clean build.spec && dist/AudioMaskPro/AudioMaskPro --s
 | 2026-10-03 | 1 | Repo initialised; Task 1 engine + 31 tests implemented, all passing; MP3→WAV CLI smoke test OK. |
 | 2026-10-03 | 2 | Task 2 UI (`ui/app_ui.py`, `main.py`) implemented; verified under Xvfb incl. threaded batch + error path; tests green. |
 | 2026-10-03 | 3 | Task 3 hardening: `core/logging_setup.py`, engine `probe()`/duration/NaN/FFmpeg/write error paths, UI pre-flight + log/output buttons + safe shutdown, `tests/test_ui_logic.py` (28). 59/59 tests pass; Xvfb batch + `main.py` start-up log verified. |
+| 2026-10-03 | 6 | **F2 UI banner**: `ffmpeg_status_line` / `build_file_dialog_filetypes` / `classify_input_path` / `AudioMaskApp.add_files` in `ui/app_ui.py`; `log_environment` uses locator; +9 tests (102/102). Xvfb verified `[INFO] FFmpeg backend: …` and `[WARN]` paths. |
 | 2026-10-03 | 5 | **F1 bundled FFmpeg**: `core/ffmpeg_locator.py`, FFmpeg-first decode order in `core/audio_engine.py`, extended extension tables (video containers), `bin/` + `tools/fetch_ffmpeg.py`, `tests/test_formats.py` (34). 93/93 tests; M4A/MP4 decode verified with system PATH stripped. |
 | 2026-10-03 | 4 | Task 4 packaging: `build.spec`, `hooks/rthook_numba.py`, `build.bat`, `build.sh`, `README.md`, `main.py --selftest`, v1.0.0. Fixed 3 spec issues (PyInstaller alias conflict, scipy.spatial, sklearn). Frozen Linux build starts under Xvfb and passes `--selftest`; 59/59 tests. **Roadmap complete.** |

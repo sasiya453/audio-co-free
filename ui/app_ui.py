@@ -33,7 +33,10 @@ from typing import List, Optional, Tuple
 import customtkinter as ctk
 
 from core.audio_engine import (
+    COMPRESSED_INPUT_EXTENSIONS,
+    NATIVE_INPUT_EXTENSIONS,
     SUPPORTED_INPUT_EXTENSIONS,
+    VIDEO_CONTAINER_EXTENSIONS,
     AudioEngineError,
     AudioLoadError,
     AudioMasker,
@@ -146,6 +149,71 @@ def dir_is_writable(path: Path) -> bool:
         return False
 
 
+def ffmpeg_status_line(masker: AudioMasker) -> Tuple[str, bool]:
+    """
+    Build the start-up console line describing the FFmpeg backend.
+
+    Returns ``(message, available)``. The message always starts with an
+    ``[INFO]`` or ``[WARN]`` tag so the console makes the backend state
+    unmistakable, e.g.::
+
+        [INFO] FFmpeg backend: Bundled (7.1) -> C:\\...\\_internal\\bin\\ffmpeg.exe
+        [WARN] FFmpeg backend: not found - M4A/AAC/WMA/MP4 decoding disabled. ...
+    """
+    try:
+        available = bool(getattr(masker, "ffmpeg_available", False)
+                         or getattr(masker, "ffmpeg_path", None))
+    except Exception:  # noqa: BLE001
+        available = False
+    if not available:
+        return ("[WARN] FFmpeg backend: not found - M4A/AAC/WMA/MP4 decoding "
+                "disabled. Reinstall the app (bin/ffmpeg.exe) or install "
+                "FFmpeg and add it to PATH.", False)
+    info = getattr(masker, "ffmpeg_info", None)
+    label = "Found"
+    if info is not None:
+        try:
+            label = str(info.label)
+        except Exception:  # noqa: BLE001
+            label = "Found"
+    return f"[INFO] FFmpeg backend: {label} -> {masker.ffmpeg_path}", True
+
+
+def _patterns(exts) -> str:
+    """``(".m4a", ".mp4")`` -> ``"*.m4a *.mp4"`` (Tk filetypes syntax)."""
+    return " ".join(f"*{e}" for e in dict.fromkeys(exts))
+
+
+def build_file_dialog_filetypes() -> List[Tuple[str, str]]:
+    """
+    ``filetypes`` for :func:`tkinter.filedialog.askopenfilenames`.
+
+    Derived from the engine's extension tables so the dialog never lags
+    behind what the decoder actually accepts. The first entry ("All media")
+    is the default filter and includes every supported extension; ``*.*``
+    stays available because the engine attempts unknown containers anyway.
+    """
+    return [
+        ("All media (audio + video)", _patterns(SUPPORTED_INPUT_EXTENSIONS)),
+        ("Audio - uncompressed / lossless", _patterns(NATIVE_INPUT_EXTENSIONS)),
+        ("Audio - compressed (M4A, AAC, WMA ...)",
+         _patterns(COMPRESSED_INPUT_EXTENSIONS)),
+        ("Video (audio track extracted)",
+         _patterns(VIDEO_CONTAINER_EXTENSIONS)),
+        ("All files", "*.*"),
+    ]
+
+
+def classify_input_path(path: Path) -> str:
+    """
+    ``"supported"`` when the extension is in :data:`SUPPORTED_INPUT_EXTENSIONS`,
+    ``"unknown"`` otherwise. Unknown files are **not rejected** - the engine
+    lets FFmpeg sniff the container - the UI merely logs a hint.
+    """
+    return ("supported" if path.suffix.lower() in SUPPORTED_INPUT_EXTENSIONS
+            else "unknown")
+
+
 def open_in_file_browser(path: Path) -> bool:
     """Reveal ``path`` with the OS file browser. Never raises."""
     try:
@@ -207,9 +275,15 @@ class AudioMaskApp(ctk.CTk):
         self._poll_id = self.after(POLL_MS, self._poll_queue)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.log(f"{APP_TITLE} v{APP_VERSION} ready.")
-        if not self.masker.ffmpeg_path:
-            self.log("Note: FFmpeg not found on PATH - MP3/M4A decoding may "
-                     "fall back to audioread or fail.")
+        self._log_ffmpeg_status()
+
+    def _log_ffmpeg_status(self) -> None:
+        """Announce which FFmpeg backend (bundled / system) is in use."""
+        message, available = ffmpeg_status_line(self.masker)
+        self.log(message)
+        if available:
+            self.log("Universal input enabled: WAV/FLAC/OGG/MP3 plus M4A, AAC, "
+                     "WMA, Opus and video containers (MP4/MKV/MOV/WebM).")
 
     # ------------------------------------------------------------------ #
     # Window / layout
@@ -517,23 +591,34 @@ class AudioMaskApp(ctk.CTk):
     # File selection
     # ------------------------------------------------------------------ #
     def _pick_files(self) -> None:
-        patterns = " ".join(f"*{ext}" for ext in SUPPORTED_INPUT_EXTENSIONS)
         paths = filedialog.askopenfilenames(
-            title="Select audio files",
-            filetypes=[("Audio files", patterns), ("All files", "*.*")])
+            title="Select audio or video files",
+            filetypes=build_file_dialog_filetypes())
         if not paths:
             return
+        self.add_files([Path(p) for p in paths])
+
+    def add_files(self, paths: List[Path]) -> int:
+        """
+        Queue ``paths`` for processing (shared by the dialog and any future
+        drag-and-drop handler). Files are never rejected by extension - the
+        engine lets FFmpeg sniff unknown containers; unknown extensions only
+        get a console hint. Returns the number of files actually added.
+        """
         added = 0
-        for p in paths:
-            path = Path(p)
-            if path.suffix.lower() not in SUPPORTED_INPUT_EXTENSIONS:
-                self.log(f"Skipped unsupported file: {path.name}")
+        for path in paths:
+            if path.is_dir():
+                self.log(f"Skipped folder: {path.name}")
                 continue
+            if classify_input_path(path) == "unknown":
+                self.log(f"Note: {path.name} has an unrecognised extension - "
+                         "will try to decode it with FFmpeg anyway.")
             if path not in self._files:
                 self._files.append(path)
                 added += 1
         self._refresh_file_box()
         self.log(f"Added {added} file(s); {len(self._files)} queued.")
+        return added
 
     def _clear_files(self) -> None:
         self._files.clear()

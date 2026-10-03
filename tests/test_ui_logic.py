@@ -92,6 +92,12 @@ class LoggingSetupTests(unittest.TestCase):
             path = logging_setup.configure_logging(console=False)
         self.assertIsNone(path)
 
+    def test_log_environment_reports_ffmpeg_backend(self) -> None:
+        with self.assertLogs("audiomask.main", level="INFO") as cm:
+            logging_setup.log_environment()
+        self.assertTrue(any("FFmpeg backend:" in line for line in cm.output),
+                        cm.output)
+
     def test_log_environment_does_not_raise(self) -> None:
         logging_setup.log_environment(logging.getLogger("audiomask.test"))
 
@@ -307,6 +313,108 @@ class UiHelperTests(unittest.TestCase):
         with mock.patch("ui.app_ui.subprocess.Popen", side_effect=OSError("no")):
             with mock.patch("ui.app_ui.sys.platform", "linux"):
                 self.assertFalse(self.ui.open_in_file_browser(self.dir))
+
+    # -- F2: FFmpeg banner + universal-format dialog ----------------------
+    def test_ffmpeg_status_line_bundled(self) -> None:
+        from core.ffmpeg_locator import FFmpegInfo
+        info = FFmpegInfo(path=r"C:\App\_internal\bin\ffmpeg.exe",
+                          source="bundled", version="7.1")
+        masker = mock.Mock(ffmpeg_available=True, ffmpeg_info=info,
+                           ffmpeg_path=info.path)
+        msg, ok = self.ui.ffmpeg_status_line(masker)
+        self.assertTrue(ok)
+        self.assertTrue(msg.startswith("[INFO] FFmpeg backend: "), msg)
+        self.assertIn("Bundled", msg)
+        self.assertIn("7.1", msg)
+        self.assertIn(info.path, msg)
+
+    def test_ffmpeg_status_line_system_path(self) -> None:
+        from core.ffmpeg_locator import FFmpegInfo
+        info = FFmpegInfo(path="/usr/bin/ffmpeg", source="path", version="6.0")
+        masker = mock.Mock(ffmpeg_available=True, ffmpeg_info=info,
+                           ffmpeg_path=info.path)
+        msg, ok = self.ui.ffmpeg_status_line(masker)
+        self.assertTrue(ok)
+        self.assertTrue(msg.startswith("[INFO] FFmpeg backend: "), msg)
+        self.assertIn("System PATH", msg)
+
+    def test_ffmpeg_status_line_found_without_info(self) -> None:
+        # Explicit ffmpeg_path injected into AudioMasker -> no FFmpegInfo.
+        masker = mock.Mock(ffmpeg_available=True, ffmpeg_info=None,
+                           ffmpeg_path="/opt/ffmpeg")
+        msg, ok = self.ui.ffmpeg_status_line(masker)
+        self.assertTrue(ok)
+        self.assertEqual(msg, "[INFO] FFmpeg backend: Found -> /opt/ffmpeg")
+
+    def test_ffmpeg_status_line_missing(self) -> None:
+        masker = mock.Mock(ffmpeg_available=False, ffmpeg_info=None,
+                           ffmpeg_path=None)
+        msg, ok = self.ui.ffmpeg_status_line(masker)
+        self.assertFalse(ok)
+        self.assertTrue(msg.startswith("[WARN] FFmpeg backend: not found"), msg)
+        self.assertIn("bin/ffmpeg.exe", msg)
+
+    def test_ffmpeg_status_line_real_masker(self) -> None:
+        msg, ok = self.ui.ffmpeg_status_line(AudioMasker())
+        self.assertIsInstance(msg, str)
+        self.assertTrue(msg.startswith("[INFO]") or msg.startswith("[WARN]"))
+        self.assertEqual(ok, msg.startswith("[INFO]"))
+
+    def test_file_dialog_filetypes_cover_all_supported(self) -> None:
+        from core.audio_engine import (COMPRESSED_INPUT_EXTENSIONS,
+                                       SUPPORTED_INPUT_EXTENSIONS,
+                                       VIDEO_CONTAINER_EXTENSIONS)
+        types = self.ui.build_file_dialog_filetypes()
+        self.assertGreaterEqual(len(types), 3)
+        for label, pattern in types:
+            self.assertIsInstance(label, str)
+            self.assertIsInstance(pattern, str)
+            self.assertTrue(pattern)
+        all_label, all_pattern = types[0]
+        self.assertIn("All media", all_label)
+        pats = set(all_pattern.split())
+        for ext in SUPPORTED_INPUT_EXTENSIONS:
+            self.assertIn(f"*{ext}", pats)
+        for must in ("*.m4a", "*.aac", "*.wma", "*.ogg", "*.flac", "*.mp4",
+                     "*.mkv", "*.mp3", "*.wav"):
+            self.assertIn(must, pats)
+        # dedicated groups exist and are populated from the engine tables
+        joined = {lbl: set(p.split()) for lbl, p in types}
+        comp = next(v for k, v in joined.items() if "M4A" in k)
+        vid = next(v for k, v in joined.items() if k.startswith("Video"))
+        self.assertEqual(comp, {f"*{e}" for e in COMPRESSED_INPUT_EXTENSIONS})
+        self.assertEqual(vid, {f"*{e}" for e in VIDEO_CONTAINER_EXTENSIONS})
+        self.assertEqual(types[-1], ("All files", "*.*"))
+
+    def test_classify_input_path_never_rejects(self) -> None:
+        c = self.ui.classify_input_path
+        for name in ("a.m4a", "b.AAC", "c.ogg", "d.flac", "e.wma", "f.mp4",
+                     "g.MKV", "h.wav", "i.mp3", "j.webm", "k.opus"):
+            self.assertEqual(c(Path(name)), "supported", name)
+        self.assertEqual(c(Path("weird.xyz")), "unknown")
+        self.assertEqual(c(Path("noext")), "unknown")
+
+    def test_add_files_accepts_compressed_and_unknown(self) -> None:
+        """Run ``AudioMaskApp.add_files`` without constructing a Tk window."""
+        app = self.ui.AudioMaskApp.__new__(self.ui.AudioMaskApp)
+        app._files = []
+        app._refresh_file_box = lambda: None
+        logs: list = []
+        app.log = logs.append
+        files = [self.dir / "song.m4a", self.dir / "clip.mp4",
+                 self.dir / "odd.xyz", self.dir / "song.m4a"]
+        for f in files[:3]:
+            f.write_bytes(b"\0")
+        added = app.add_files(files)
+        self.assertEqual(added, 3)             # duplicate ignored, none rejected
+        self.assertEqual([p.name for p in app._files],
+                         ["song.m4a", "clip.mp4", "odd.xyz"])
+        self.assertTrue(any("odd.xyz" in m and "FFmpeg" in m for m in logs))
+        self.assertFalse(any("unsupported" in m.lower() for m in logs))
+        # folders are skipped
+        sub = self.dir / "folder"
+        sub.mkdir()
+        self.assertEqual(app.add_files([sub]), 0)
 
 
 if __name__ == "__main__":  # pragma: no cover

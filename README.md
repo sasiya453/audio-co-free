@@ -13,6 +13,8 @@ from a modern dark-mode CustomTkinter interface with a fully non-blocking UI.
 > responsible for holding the rights to any audio you process and for complying
 > with the terms of service of any platform you upload results to.
 
+Download : https://github.com/sazindux/AudioMask-CopyrigRemover-Audio/releases
+
 ---
 
 ## What it does

@@ -5,6 +5,10 @@ manipulation: time-stretching, high-resolution pitch shifting, structural
 frequency masking, micro-reverb room simulation and peak normalisation — all
 from a modern dark-mode CustomTkinter interface with a fully non-blocking UI.
 
+<p align="center">
+  <img src="https://i.ibb.co/dszdm2Z1/file-366.jpg" width="30%" alt="Testing">
+</p>
+
 > **Disclaimer.** AudioMask Pro is a signal-processing tool. You are solely
 > responsible for holding the rights to any audio you process and for complying
 > with the terms of service of any platform you upload results to.
